@@ -231,13 +231,37 @@ export default function App() {
       }
     : undefined;
 
+  // Browser Back button: step back to the previous screen instead of leaving the site.
+  const screenRef = useRef(screen);
+  useEffect(() => {
+    screenRef.current = screen;
+    if (screen !== "home" && window.history.state?.screen !== screen) {
+      window.history.pushState({ screen }, "");
+    }
+  }, [screen]);
+  useEffect(() => {
+    window.history.replaceState({ screen: "home" }, "");
+    const onPop = () => {
+      const cur = screenRef.current;
+      if (cur === "auction" && !window.confirm("Leave the auction screen? You stay in the room and can return from the home page.")) {
+        window.history.pushState({ screen: "auction" }, "");
+        return;
+      }
+      setScreen("home");
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
   useEffect(() => {
     const s = io(SERVER, { transports: ["websocket", "polling"] });
     s.on("connect", () => setMyId(s.id || ""));
     s.on("state", (x: AuctionState) => {
       setState(x);
-      if (x.phase === "BIDDING") setScreen("auction");
-      if (x.phase === "COMPLETE") setScreen("results");
+      // Only move screens if the player is inside a room screen; if they chose to go
+      // Home (Back button), don't yank them back on every timer tick.
+      if (x.phase === "BIDDING") setScreen((prev) => (prev === "home" ? prev : "auction"));
+      if (x.phase === "COMPLETE") setScreen((prev) => (prev === "home" ? prev : "results"));
     });
     s.on("siteConfig", (cfg: SiteConfig) => setSiteConfigState(cfg));
     s.on("authResult", (r: { ok: boolean; email?: string; name?: string; reason?: string }) => {
@@ -399,7 +423,7 @@ export default function App() {
     setScreen("lobby");
   }
   function join() {
-    socket?.emit("joinRoom", { roomCode: room.trim().toUpperCase(), name: name || "Player", teamId: selectedTeam });
+    socket?.emit("joinRoom", { roomCode: room.trim().toUpperCase(), name: name || "Player" });
     setScreen("lobby");
   }
   function start() { socket?.emit("startAuction"); }
@@ -618,7 +642,9 @@ export default function App() {
         <small>REAL-TIME • MULTI-DEVICE • TEAM MODE</small>
         <h1>THE<br /><i>CHARACTER</i><br />AUCTION</h1>
         <p>Every friend joins from their own phone. Play as teams with a shared wallet, or go solo and bid head-to-head against your friends. Fully custom character roster — your images, your ability notes, your power scores, your value limits, your background.</p>
-        <button className="primary" onClick={() => setScreen("lobby")}><Gavel /> CREATE / JOIN GAME</button>
+        <button className="primary" onClick={() => setScreen(state?.phase === "BIDDING" ? "auction" : state?.phase === "COMPLETE" ? "results" : "lobby")}>
+          <Gavel /> {state?.phase === "BIDDING" ? "RETURN TO AUCTION" : state?.phase === "COMPLETE" ? "VIEW RESULTS" : "CREATE / JOIN GAME"}
+        </button>
         <div className="hero-tags">
           <span><Sparkles size={14} /> Custom characters</span>
           <span><Users size={14} /> Team or solo mode</span>
@@ -709,7 +735,7 @@ export default function App() {
               </p>
               {state.mode === "TEAM" && (
                 <label>Choose your team
-                  <select value={selectedTeam} onChange={(e) => setSelectedTeam(e.target.value)}>
+                  <select value={me?.teamId || selectedTeam} onChange={(e) => { setSelectedTeam(e.target.value); if (me) socket?.emit("switchTeam", { teamId: e.target.value }); }}>
                     {state.teams.map((t) => <option key={t.id} value={t.id}>{t.name} ({t.members.length}/5)</option>)}
                   </select>
                 </label>

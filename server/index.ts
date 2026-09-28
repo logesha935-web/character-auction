@@ -290,13 +290,35 @@ io.on("connection", socket=>{
       };
       s.teams.push(team);
     } else {
-      team = s.teams.find(t=>t.id===data.teamId);
+      // No team chosen yet -> put the newcomer on the emptiest team (so a friend lands as an opponent, not on the host's team).
+      team = data.teamId
+        ? s.teams.find(t=>t.id===data.teamId)
+        : [...s.teams].sort((a,b)=>a.members.length-b.members.length)[0];
       if(!team) return socket.emit("errorMessage","Choose a valid team.");
       if(team.members.length>=5) return socket.emit("errorMessage","That team is full (max 5).");
     }
     const player:Player={id:socket.id,name:data.name?.trim()||`Player ${s.players.length+1}`,teamId:team.id,connected:true,isHost:false};
     s.players.push(player); team.members.push(socket.id);
     socket.join(s.roomCode); socket.data.room=s.roomCode; emit(s.roomCode);
+  });
+
+  // Lets a player move to a different team while still in the lobby (Team mode only).
+  socket.on("switchTeam",(data:{teamId:string})=>{
+    if (!requireAuth(socket)) return;
+    const s=rooms.get(socket.data.room);
+    if(!s) return;
+    if(s.mode!=="TEAM") return;
+    if(s.phase!=="LOBBY") return socket.emit("errorMessage","Teams are locked once the auction starts.");
+    const player=s.players.find(x=>x.id===socket.id);
+    const target=s.teams.find(t=>t.id===data?.teamId);
+    if(!player || !target) return;
+    if(player.teamId===target.id) return;
+    if(target.members.length>=5) return socket.emit("errorMessage","That team is full (max 5).");
+    const from=s.teams.find(t=>t.id===player.teamId);
+    if(from) from.members=from.members.filter(id=>id!==socket.id);
+    target.members.push(socket.id);
+    player.teamId=target.id;
+    emit(s.roomCode);
   });
 
   socket.on("startAuction",()=>{
