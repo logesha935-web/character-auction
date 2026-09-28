@@ -67,5 +67,7 @@ export type AuctionState = {
   bidIncrement: number;
   timer: number;
   timerMax: number;
-  history: { character: Character; teamId: string; amount: number }[];
+  currentBidderPlayerId?: string | null;
+  currentBidderName?: string | null;
+  history: { character: Character; teamId: string; amount: number; playerId?: string; playerName?: string }[];
 };

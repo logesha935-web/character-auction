@@ -19,6 +19,8 @@ const io = new Server(httpServer, { cors: { origin: "*" }, maxHttpBufferSize: 25
 const rooms = new Map<string, AuctionState>();
 const timers = new Map<string, NodeJS.Timeout>();
 const unsoldCountsByRoom = new Map<string, Map<string, number>>();
+// One entry per Google account per room: room code -> (email -> player socket id).
+const emailsByRoom = new Map<string, Map<string, string>>();
 const MAX_ROUNDS = 5;
 const MAX_SOLO_PLAYERS = 12;
 
@@ -138,7 +140,7 @@ function concludeCurrent(room:string, sold:boolean){
     if(team){
       team.spent += s.currentBid;
       team.roster.push(character);
-      s.history.push({ character, teamId: team.id, amount: s.currentBid });
+      s.history.push({ character, teamId: team.id, amount: s.currentBid, playerId: s.currentBidderPlayerId || undefined, playerName: s.currentBidderName || undefined });
     }
   } else {
     const counts = unsoldCountsByRoom.get(room) || new Map<string, number>();
@@ -166,7 +168,7 @@ function advanceAuction(room:string){
       s.currentIndex = 0;
       s.phase = "BIDDING";
       s.currentBid = s.characters[0].basePrice;
-      s.currentBidderTeamId = null;
+      s.currentBidderTeamId = null; s.currentBidderPlayerId = null; s.currentBidderName = null;
       s.timer = s.timerMax;
       emit(room);
       startTimer(room);
@@ -182,7 +184,7 @@ function advanceAuction(room:string){
   }
   s.phase = "BIDDING";
   s.currentBid = s.characters[s.currentIndex].basePrice;
-  s.currentBidderTeamId = null;
+  s.currentBidderTeamId = null; s.currentBidderPlayerId = null; s.currentBidderName = null;
   s.timer = s.timerMax;
   emit(room);
   startTimer(room);
@@ -268,11 +270,12 @@ io.on("connection", socket=>{
       roomCode:code, title:cfg.title||"Character Auction", mode, phase:"LOBBY",
       players:[player], teams, characters, limits, background:undefined,
       round:1, unsoldQueue:[], finalUnsold:[],
-      currentIndex:0, currentBid:0, currentBidderTeamId:null,
+      currentIndex:0, currentBid:0, currentBidderTeamId:null, currentBidderPlayerId:null, currentBidderName:null,
       bidIncrement:Math.max(1,cfg.bidIncrement||1000),
       timer:Math.max(5,cfg.timerMax||15), timerMax:Math.max(5,cfg.timerMax||15), history:[]
     };
-    rooms.set(code,state); unsoldCountsByRoom.set(code, new Map()); socket.join(code); socket.data.room=code; emit(code);
+    rooms.set(code,state); unsoldCountsByRoom.set(code, new Map());
+    emailsByRoom.set(code, new Map([[String(socket.data.authedEmail).toLowerCase(), socket.id]])); socket.join(code); socket.data.room=code; emit(code);
   });
 
   socket.on("joinRoom",(data:{roomCode:string;name:string;teamId?:string})=>{
@@ -280,6 +283,24 @@ io.on("connection", socket=>{
     if (!requireAuth(socket)) return;
     if(!s) return socket.emit("errorMessage","Room not found.");
     if(s.phase!=="LOBBY") return socket.emit("errorMessage","This auction has already started.");
+
+    // One entry per Google account: the same account can't be a player twice in a room.
+    const emailKey=String(socket.data.authedEmail).toLowerCase();
+    const seen=emailsByRoom.get(s.roomCode) || new Map<string,string>();
+    emailsByRoom.set(s.roomCode, seen);
+    if(s.players.some(x=>x.id===socket.id)) return socket.emit("errorMessage","You are already in this room.");
+    const existingId=seen.get(emailKey);
+    if(existingId){
+      const old=s.players.find(x=>x.id===existingId);
+      if(old && old.isHost) return socket.emit("errorMessage","This Google account is the host of this room.");
+      if(old && old.connected) return socket.emit("errorMessage","This Google account has already joined this room as a player.");
+      // Previous connection dropped (refresh / lost signal): let them take their seat back.
+      if(old){
+        s.players=s.players.filter(x=>x.id!==old.id);
+        for(const tm of s.teams) tm.members=tm.members.filter(id=>id!==old.id);
+        if(s.mode==="SOLO" && !old.isHost) s.teams=s.teams.filter(tm=>tm.members.length>0 || tm.id==="t1");
+      }
+    }
 
     let team:Team|undefined;
     if(s.mode === "SOLO"){
@@ -298,7 +319,7 @@ io.on("connection", socket=>{
       if(team.members.length>=5) return socket.emit("errorMessage","That team is full (max 5).");
     }
     const player:Player={id:socket.id,name:data.name?.trim()||`Player ${s.players.length+1}`,teamId:team.id,connected:true,isHost:false};
-    s.players.push(player); team.members.push(socket.id);
+    s.players.push(player); team.members.push(socket.id); seen.set(emailKey, socket.id);
     socket.join(s.roomCode); socket.data.room=s.roomCode; emit(s.roomCode);
   });
 
@@ -330,7 +351,7 @@ io.on("connection", socket=>{
     if(!s.characters.length) return socket.emit("errorMessage","Add at least one character before starting.");
     unsoldCountsByRoom.set(room, new Map());
     s.phase="BIDDING"; s.round=1; s.unsoldQueue=[]; s.finalUnsold=[];
-    s.currentIndex=0; s.currentBid=s.characters[0].basePrice; s.currentBidderTeamId=null; s.timer=s.timerMax;
+    s.currentIndex=0; s.currentBid=s.characters[0].basePrice; s.currentBidderTeamId=null; s.currentBidderPlayerId=null; s.currentBidderName=null; s.timer=s.timerMax;
     emit(room); startTimer(room);
   });
 
@@ -344,7 +365,7 @@ io.on("connection", socket=>{
     if(!p || !team || !Number.isFinite(amount)) return;
     if(amount<s.currentBid+s.bidIncrement) return socket.emit("errorMessage",`Minimum bid is ₹${s.currentBid+s.bidIncrement}.`);
     if(team.budget-team.spent<amount) return socket.emit("errorMessage","Your team doesn't have enough budget.");
-    s.currentBid=amount; s.currentBidderTeamId=team.id;
+    s.currentBid=amount; s.currentBidderTeamId=team.id; s.currentBidderPlayerId=p.id; s.currentBidderName=p.name;
     if(s.timer<=3) s.timer=Math.min(s.timerMax,10);
     emit(room);
   });

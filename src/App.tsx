@@ -154,6 +154,15 @@ function playCustomOneShot(url: string, volume: number) {
   } catch { /* ignore malformed audio */ }
 }
 
+// Small round character icon used to show what a player has bought.
+function MiniIcon({ c, size = 26 }: { c: Character; size?: number }) {
+  return (
+    <span className="mini-icon" style={{ width: size, height: size }} title={c.name}>
+      {c.image ? <img src={c.image} alt={c.name} /> : <span>{c.name[0]}</span>}
+    </span>
+  );
+}
+
 export default function App() {
   const [socket, setSocket] = useState<Socket | null>(null);
   const [screen, setScreen] = useState<"home" | "lobby" | "auction" | "results">("home");
@@ -948,7 +957,17 @@ export default function App() {
           {state.teams.map((t) => (
             <div className={`team live ${t.id === state.currentBidderTeamId ? "active" : ""}`} key={t.id}>
               <b>{t.name}</b>
-              <span>{t.members.map((id) => state.players.find((p) => p.id === id)?.name).filter(Boolean).join(", ")}</span>
+              {t.members.map((id) => state.players.find((p) => p.id === id)).filter(Boolean).map((pl) => {
+                const bought = state.history.filter((h) => h.playerId === pl!.id);
+                return (
+                  <div className="player-bought" key={pl!.id}>
+                    <span className="pb-name">{pl!.name}{!pl!.connected ? " (offline)" : ""}</span>
+                    <div className="pb-icons">
+                      {bought.length === 0 ? <em className="muted small">no buys yet</em> : bought.map((h, i) => <MiniIcon key={i} c={h.character} />)}
+                    </div>
+                  </div>
+                );
+              })}
               <strong>{money(t.budget - t.spent)}</strong>
               <small>{t.roster.length} won</small>
             </div>
@@ -967,7 +986,7 @@ export default function App() {
               <p className="stats-line">Power {current.power} • Popularity {current.popularity}</p>
               <div className="current">
                 CURRENT BID <b>{money(state.currentBid)}</b>
-                <span>{state.currentBidderTeamId ? state.teams.find((t) => t.id === state.currentBidderTeamId)?.name : "NO BID"}</span>
+                <span>{state.currentBidderTeamId ? `${state.currentBidderName ? state.currentBidderName + " • " : ""}${state.teams.find((t) => t.id === state.currentBidderTeamId)?.name}` : "NO BID"}</span>
               </div>
             </div>
           </div>
@@ -998,7 +1017,7 @@ export default function App() {
               : "Any member of your team can bid. Every member sees the same live auction."}
           </p>
           <small>RECENT SALES</small>
-          {state.history.slice(-6).reverse().map((h, i) => <div className="history" key={i}><span>{h.character.name}</span><b>{money(h.amount)}</b></div>)}
+          {state.history.slice(-6).reverse().map((h, i) => <div className="history" key={i}><MiniIcon c={h.character} size={22} /><span className="h-text">{h.character.name}<small> ← {h.playerName || state.teams.find((tm) => tm.id === h.teamId)?.name}</small></span><b>{money(h.amount)}</b></div>)}
         </aside>
       </div>
       <section className="roster-overview">
@@ -1011,7 +1030,7 @@ export default function App() {
                 <div className="roster-thumb">
                   {h.character.image ? <img src={h.character.image} alt={h.character.name} /> : <span>{h.character.name[0]}</span>}
                 </div>
-                <div className="roster-meta"><b>{h.character.name}</b><span>{state.teams.find((t) => t.id === h.teamId)?.name}</span></div>
+                <div className="roster-meta"><b>{h.character.name}</b><span>Bought by {h.playerName || "?"} • {state.teams.find((t) => t.id === h.teamId)?.name}</span></div>
                 <strong>{money(h.amount)}</strong>
               </div>
             ))}
@@ -1074,12 +1093,36 @@ export default function App() {
       <Trophy size={42} />
       <small>AUCTION COMPLETE{state && state.round > 1 ? ` • ${state.round} ROUNDS` : ""}</small>
       <h1>FINAL RESULTS</h1>
-      {state?.teams.slice().sort((a, b) => b.roster.reduce((s, c) => s + c.power, 0) - a.roster.reduce((s, c) => s + c.power, 0)).map((t) => (
-        <div className="result" key={t.id}>
-          <div><h2>{t.name}</h2><p>{t.members.map((id) => state.players.find((p) => p.id === id)?.name).filter(Boolean).join(" • ")}</p></div>
-          <strong>{t.roster.reduce((s, c) => s + c.power, 0)}<small> POWER</small></strong>
-        </div>
-      ))}
+      {state?.teams.slice().sort((a, b) => b.roster.reduce((s, c) => s + c.power, 0) - a.roster.reduce((s, c) => s + c.power, 0)).map((t) => {
+        const members = t.members.map((id) => state.players.find((p) => p.id === id)).filter(Boolean);
+        const teamWins = state.history.filter((h) => h.teamId === t.id);
+        return (
+          <div className="result result-full" key={t.id}>
+            <div className="result-head">
+              <div><h2>{t.name}</h2><p>{members.map((p) => p!.name).join(" • ")}</p></div>
+              <strong>{t.roster.reduce((s, c) => s + c.power, 0)}<small> POWER</small></strong>
+            </div>
+            {members.map((pl) => {
+              const won = teamWins.filter((h) => h.playerId === pl!.id);
+              return (
+                <div className="won-block" key={pl!.id}>
+                  <b>{pl!.name} won {won.length} character{won.length === 1 ? "" : "s"}</b>
+                  <div className="won-grid">
+                    {won.length === 0 && <span className="muted small">Nothing won.</span>}
+                    {won.map((h, i) => (
+                      <div className="won-card" key={i}>
+                        <MiniIcon c={h.character} size={44} />
+                        <span>{h.character.name}</span>
+                        <small>{money(h.amount)} • P{h.character.power}</small>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
       {state && state.finalUnsold.length > 0 && (
         <div className="unsold-final">
           <small>NEVER SOLD</small>
