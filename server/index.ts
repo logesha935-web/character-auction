@@ -31,7 +31,10 @@ const MAX_SOLO_PLAYERS = 12;
 // env var) to whatever only you know, so nobody else can overwrite these from
 // their phone.
 const OWNER_KEY = process.env.AUCTION_OWNER_KEY || "loki-owner-2026";
-const SITE_MEDIA_FIELDS: SiteMediaField[] = ["background", "bgm", "soldSound", "queueSound", "trashSound", "heartbeatSound"];
+const SITE_MEDIA_FIELDS: SiteMediaField[] = ["background", "backgroundVideo", "bgm", "soldSound", "queueSound", "trashSound", "heartbeatSound"];
+// Video wallpapers are much bigger than images/short sound clips, so they get their own,
+// larger size ceiling (still comfortably under the server's 25MB socket/body limit).
+const SITE_VIDEO_MAX_BYTES = 18_000_000;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const SITE_CONFIG_PATH = path.join(__dirname, "site-config.json");
@@ -199,7 +202,8 @@ io.on("connection", socket=>{
     if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage","Incorrect owner key.");
     if (!SITE_MEDIA_FIELDS.includes(data.field)) return;
     if (typeof data.value !== "string") return;
-    if (data.value.length > 8_000_000) return socket.emit("errorMessage","That file is too large — try a smaller one.");
+    const limit = data.field === "backgroundVideo" ? SITE_VIDEO_MAX_BYTES : 8_000_000;
+    if (data.value.length > limit) return socket.emit("errorMessage","That file is too large — try a smaller one.");
     siteConfig = { ...siteConfig, [data.field]: data.value || undefined };
     saveSiteConfig();
     io.emit("siteConfig", siteConfig); // broadcast to everyone, everywhere, live
@@ -428,6 +432,39 @@ io.on("connection", socket=>{
     if(typeof dataUrl !== "string") return;
     if(dataUrl.length > 6_000_000) return socket.emit("errorMessage","Background image is too large — try a smaller file.");
     s.background = dataUrl || undefined;
+    emit(room);
+  });
+
+  // Owner-only: change one character's picture from the auction page itself, any
+  // phase, any room. Uses the same global owner key as the site settings panel —
+  // not the per-room host key — so only you can do this from your own device.
+  // Whatever is set here stays on that character (in every room using it) until
+  // you change it again; nothing else about the character is touched.
+  socket.on("setCharacterImage",(data:{key:string; characterId:string; image:string})=>{
+    if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage","Incorrect owner key.");
+    const room=socket.data.room; const s=rooms.get(room);
+    if(!s) return socket.emit("errorMessage","You're not in a room.");
+    if(typeof data.image !== "string") return;
+    if(data.image.length > 6_000_000) return socket.emit("errorMessage","That image is too large — try a smaller one.");
+    const char=s.characters.find(c=>c.id===data.characterId);
+    if(!char) return socket.emit("errorMessage","Character not found.");
+    char.image = data.image || undefined;
+    emit(room);
+  });
+
+  // Host-only: reset a finished room back to the lobby, same players/teams/roster/
+  // characters, so the same group can run another round without recreating a room.
+  socket.on("resetRoom",()=>{
+    if (!requireAuth(socket)) return;
+    const room=socket.data.room; const s=rooms.get(room);
+    const p=s?.players.find(x=>x.id===socket.id);
+    if(!s || !p?.isHost) return socket.emit("errorMessage","Only the host can start a new round.");
+    stopTimer(room);
+    unsoldCountsByRoom.set(room, new Map());
+    s.phase="LOBBY"; s.round=1; s.unsoldQueue=[]; s.finalUnsold=[]; s.history=[];
+    s.currentIndex=0; s.currentBid=0; s.currentBidderTeamId=null; s.currentBidderPlayerId=null; s.currentBidderName=null;
+    s.timer=s.timerMax;
+    for(const t of s.teams){ t.spent=0; t.roster=[]; }
     emit(room);
   });
 

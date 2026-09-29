@@ -621,3 +621,41 @@ button svg{vertical-align:-3px; margin-right:6px;}
 .won-grid{display:flex; flex-wrap:wrap; gap:10px; margin-top:8px;}
 .won-card{display:flex; flex-direction:column; align-items:center; gap:3px; width:92px; text-align:center; font-size:12px;}
 .won-card small{color:var(--muted); font-size:10.5px;}
+
+/* --- legendary red-glow reveal, card-game style, for won characters --- */
+.legendary-glow{
+  border-radius:var(--radius-sm); padding:8px 6px 10px; background:radial-gradient(circle at 50% 20%, rgba(230,32,47,0.18), transparent 70%);
+  border:1px solid var(--red-dark);
+  animation:legendaryReveal 0.5s ease-out both, legendaryPulse 1.8s ease-in-out 0.5s infinite;
+}
+.legendary-glow .mini-icon{box-shadow:0 0 0 2px var(--red-2), 0 0 18px 4px var(--red-glow);}
+@keyframes legendaryReveal{
+  0%{opacity:0; transform:scale(0.6) translateY(10px);}
+  60%{opacity:1; transform:scale(1.08) translateY(-2px);}
+  100%{opacity:1; transform:scale(1) translateY(0);}
+}
+@keyframes legendaryPulse{
+  0%, 100%{box-shadow:0 0 0 1px var(--red-dark), 0 0 10px 0px var(--red-glow); border-color:var(--red-dark);}
+  50%{box-shadow:0 0 0 1px var(--red), 0 0 26px 6px var(--red-glow); border-color:var(--red-2);}
+}
+
+/* --- results screen: play again / exit --- */
+.results-actions{
+  display:flex; gap:14px; align-items:center; margin-top:34px; flex-wrap:wrap; justify-content:center;
+}
+
+/* --- owner-only inline character image edit, shown on the auction poster --- */
+.poster-edit{
+  position:absolute; top:8px; right:8px; z-index:2;
+  display:flex; align-items:center; justify-content:center;
+  width:28px; height:28px; border-radius:50%;
+  background:rgba(7,7,10,0.75); border:1px solid var(--border-strong); color:var(--muted);
+  cursor:pointer; transition:color .15s, border-color .15s;
+}
+.poster-edit:hover{color:var(--red-2); border-color:var(--red);}
+.poster-edit input{display:none;}
+
+/* --- owner live wallpaper (video), sits behind the page content --- */
+.live-wallpaper{position:fixed; inset:0; z-index:-1; overflow:hidden;}
+.live-wallpaper video{width:100%; height:100%; object-fit:cover;}
+.live-wallpaper-overlay{position:absolute; inset:0; background:linear-gradient(rgba(7,7,10,.82), rgba(7,7,10,.92));}

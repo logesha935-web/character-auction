@@ -39,6 +39,7 @@ export type GameMode = "TEAM" | "SOLO";
 
 export type SiteConfig = {
   background?: string;
+  backgroundVideo?: string;
   bgm?: string;
   soldSound?: string;
   queueSound?: string;
@@ -46,7 +47,7 @@ export type SiteConfig = {
   heartbeatSound?: string;
 };
 
-export type SiteMediaField = "background" | "bgm" | "soldSound" | "queueSound" | "trashSound" | "heartbeatSound";
+export type SiteMediaField = "background" | "backgroundVideo" | "bgm" | "soldSound" | "queueSound" | "trashSound" | "heartbeatSound";
 
 export type AuctionState = {
   roomCode: string;

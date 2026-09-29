@@ -4,6 +4,7 @@ import {
   Gavel, Plus, Users, Upload, Play, Shuffle, ImagePlus, Trophy,
   Pencil, Trash2, Sparkles, SlidersHorizontal, X, Check, ShieldAlert,
   User, Image, CheckCircle2, XCircle, Layers, Settings, Volume2, VolumeX,
+  RotateCcw, LogOut, Video,
 } from "lucide-react";
 import { AuctionState, Character, CharacterLimits, GameMode, SiteConfig } from "./types";
 import { demoCharacters, defaultLimits } from "./data";
@@ -239,6 +240,14 @@ export default function App() {
         backgroundSize: "cover", backgroundPosition: "center", backgroundAttachment: "fixed",
       }
     : undefined;
+  // Owner-uploaded "live wallpaper" — a looping muted video behind the landing
+  // page and the auction page, in place of (or under) the static background.
+  const liveWallpaper = siteConfig.backgroundVideo ? (
+    <div className="live-wallpaper" aria-hidden="true">
+      <video src={siteConfig.backgroundVideo} autoPlay loop muted playsInline />
+      <div className="live-wallpaper-overlay" />
+    </div>
+  ) : null;
 
   // Browser Back button: step back to the previous screen instead of leaving the site.
   const screenRef = useRef(screen);
@@ -271,6 +280,9 @@ export default function App() {
       // Home (Back button), don't yank them back on every timer tick.
       if (x.phase === "BIDDING") setScreen((prev) => (prev === "home" ? prev : "auction"));
       if (x.phase === "COMPLETE") setScreen((prev) => (prev === "home" ? prev : "results"));
+      // "Play Again" resets the room to LOBBY — bounce everyone still on the
+      // results screen back into the lobby to start the next round.
+      if (x.phase === "LOBBY") setScreen((prev) => (prev === "results" ? "lobby" : prev));
     });
     s.on("siteConfig", (cfg: SiteConfig) => setSiteConfigState(cfg));
     s.on("authResult", (r: { ok: boolean; email?: string; name?: string; reason?: string }) => {
@@ -450,6 +462,27 @@ export default function App() {
     socket?.emit("setSiteConfig", { key: ownerKey.trim(), field, value: dataUrl });
   }
 
+  // Owner-only, works right from the auction page: swaps one character's picture.
+  // Needs the same owner key as Site Settings — not just "host" — and it sticks
+  // on that character until the owner changes it again.
+  async function changeCurrentCharacterImage(characterId: string, file: File | null) {
+    if (!ownerKey.trim()) return flash("Enter the owner key (Site Settings) to change character images.");
+    const dataUrl = file ? await fileToDataUrl(file) : "";
+    socket?.emit("setCharacterImage", { key: ownerKey.trim(), characterId, image: dataUrl });
+  }
+
+  // Host-only: send everyone in the room back to the lobby with a clean slate —
+  // same players, teams and character list — for another round.
+  function playAgain() {
+    if (!me?.isHost) return flash("Only the host can start a new round.");
+    socket?.emit("resetRoom");
+  }
+  // Just steps back to the home screen, same as the browser Back button — the
+  // room and your seat in it are untouched, so "Return to auction" still works.
+  function exitGame() {
+    setScreen("home");
+  }
+
   function loadAllowedEmails() {
     if (!ownerKey.trim()) return flash("Enter the owner key first.");
     socket?.emit("listAllowedEmails", { key: ownerKey.trim() });
@@ -573,7 +606,8 @@ export default function App() {
 
   // ---------------------------------------------------------------- HOME
   if (screen === "home") return (
-    <main className="home" style={homeBgStyle}>
+    <main className="home" style={liveWallpaper ? undefined : homeBgStyle}>
+      {liveWallpaper}
       <div className="nav">
         <b>◆ CHARACTER AUCTION</b>
         <span>TEAM MULTIPLAYER</span>
@@ -600,6 +634,19 @@ export default function App() {
             </label>
             {siteConfig.background && (
               <button className="ghost" onClick={() => saveSiteConfigField("background", null)}><X size={14} /> Remove background</button>
+            )}
+          </div>
+
+          <div className="site-settings-section">
+            <small>LIVE WALLPAPER (VIDEO)</small>
+            <p className="muted small">A looping video background for the landing page and the auction page — overrides the static background above while it's set. Keep clips short (10–20s) so the file stays small.</p>
+            {siteConfig.backgroundVideo && <video className="preview" src={siteConfig.backgroundVideo} autoPlay loop muted playsInline />}
+            <label className="upload wide small">
+              <Video size={14} /> {siteConfig.backgroundVideo ? "Change live wallpaper" : "Upload live wallpaper video"}
+              <input type="file" accept="video/*" onChange={(e) => saveSiteConfigField("backgroundVideo", e.target.files?.[0] || null)} />
+            </label>
+            {siteConfig.backgroundVideo && (
+              <button className="ghost" onClick={() => saveSiteConfigField("backgroundVideo", null)}><X size={14} /> Remove live wallpaper</button>
             )}
           </div>
 
@@ -666,7 +713,8 @@ export default function App() {
 
   // ---------------------------------------------------------------- LOBBY
   if (screen === "lobby") return (
-    <main className="page" style={bgStyle}>
+    <main className="page" style={liveWallpaper ? undefined : bgStyle}>
+      {liveWallpaper}
       <header className="top"><b>◆ CHARACTER AUCTION</b><span>{state?.roomCode || "NEW ROOM"}</span></header>
       <div className="grid">
         <section className="panel">
@@ -698,7 +746,7 @@ export default function App() {
                 <>
                   <label>Number of teams
                     <select value={teamCount} onChange={(e) => { const n = +e.target.value; setTeamCount(n); setTeamNames(Array.from({ length: n }, (_, i) => teamNames[i] || `Team ${i + 1}`)); }}>
-                      {[2, 3, 4, 5, 6].map((n) => <option key={n}>{n}</option>)}
+                      {[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map((n) => <option key={n}>{n}</option>)}
                     </select>
                   </label>
                   {Array.from({ length: teamCount }).map((_, i) => (
@@ -933,7 +981,8 @@ export default function App() {
   if (screen === "auction" && state && current) {
   const upcoming = state.characters.slice(state.currentIndex + 1);
   return (
-    <main className="page" style={bgStyle}>
+    <main className="page" style={liveWallpaper ? undefined : bgStyle}>
+      {liveWallpaper}
       <header className="top">
         <b>◆ {state.title}</b>
         <div>
@@ -955,8 +1004,12 @@ export default function App() {
         <aside className="panel">
           <small>TEAMS</small>
           {state.teams.map((t) => (
-            <div className={`team live ${t.id === state.currentBidderTeamId ? "active" : ""}`} key={t.id}>
-              <b>{t.name}</b>
+            <div
+              className={`team live ${t.id === state.currentBidderTeamId ? "active" : ""}`}
+              key={t.id}
+              style={{ borderLeftColor: t.id === state.currentBidderTeamId ? undefined : t.color }}
+            >
+              <b style={{ color: t.color }}>{t.name}</b>
               {t.members.map((id) => state.players.find((p) => p.id === id)).filter(Boolean).map((pl) => {
                 const bought = state.history.filter((h) => h.playerId === pl!.id);
                 return (
@@ -978,6 +1031,10 @@ export default function App() {
             <div className="poster">
               {current.image ? <img src={current.image} alt={current.name} /> : <div className="initial">{current.name[0]}</div>}
               <div className="power-badge"><Sparkles size={14} /> {current.power}<small>/{state.limits.maxPower}</small></div>
+              <label className="poster-edit" title="Owner only — change this character's image. Needs the owner key from Site Settings.">
+                <Pencil size={13} />
+                <input type="file" accept="image/*" onChange={(e) => changeCurrentCharacterImage(current.id, e.target.files?.[0] || null)} />
+              </label>
             </div>
             <div className="info">
               <small>{current.universe} • {current.rarity}</small>
@@ -1089,7 +1146,8 @@ export default function App() {
 
   // ---------------------------------------------------------------- RESULTS
   return (
-    <main className="page results" style={bgStyle}>
+    <main className="page results" style={liveWallpaper ? undefined : bgStyle}>
+      {liveWallpaper}
       <Trophy size={42} />
       <small>AUCTION COMPLETE{state && state.round > 1 ? ` • ${state.round} ROUNDS` : ""}</small>
       <h1>FINAL RESULTS</h1>
@@ -1110,7 +1168,7 @@ export default function App() {
                   <div className="won-grid">
                     {won.length === 0 && <span className="muted small">Nothing won.</span>}
                     {won.map((h, i) => (
-                      <div className="won-card" key={i}>
+                      <div className="won-card legendary-glow" key={i} style={{ animationDelay: `${i * 0.12}s` }}>
                         <MiniIcon c={h.character} size={44} />
                         <span>{h.character.name}</span>
                         <small>{money(h.amount)} • P{h.character.power}</small>
@@ -1129,6 +1187,15 @@ export default function App() {
           <p className="muted">{state.finalUnsold.map((c) => c.name).join(" • ")}</p>
         </div>
       )}
+      <div className="results-actions">
+        {me?.isHost ? (
+          <button className="primary" onClick={playAgain}><RotateCcw size={16} /> PLAY AGAIN</button>
+        ) : (
+          <p className="muted small">Waiting for the host to start a new round…</p>
+        )}
+        <button className="ghost" onClick={exitGame}><LogOut size={16} /> EXIT GAME</button>
+      </div>
+      {toast && <div className="toast">{toast}</div>}
     </main>
   );
 }
