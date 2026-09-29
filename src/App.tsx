@@ -4,7 +4,7 @@ import {
   Gavel, Plus, Users, Upload, Play, Shuffle, ImagePlus, Trophy,
   Pencil, Trash2, Sparkles, SlidersHorizontal, X, Check, ShieldAlert,
   User, Image, CheckCircle2, XCircle, Layers, Settings, Volume2, VolumeX,
-  RotateCcw, LogOut, Video,
+  RotateCcw, LogOut, Video, Library,
 } from "lucide-react";
 import { AuctionState, Character, CharacterLimits, GameMode, SiteConfig } from "./types";
 import { demoCharacters, defaultLimits } from "./data";
@@ -185,7 +185,12 @@ export default function App() {
   const [charDraft, setCharDraft] = useState<CharacterDraft>(blankDraft(defaultLimits));
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<CharacterDraft | null>(null);
-  const [managerTab, setManagerTab] = useState<"add" | "limits" | "theme" | "list">("add");
+  const [managerTab, setManagerTab] = useState<"pick" | "add" | "limits" | "theme" | "list">("pick");
+  // Character library (built-in + owner-added, permanent) and the host's ticked picks.
+  const [library, setLibrary] = useState<Character[]>([]);
+  const [defaultSel, setDefaultSel] = useState<string[] | null>(null);
+  const [pick, setPick] = useState<string[]>([]);
+  const [libEditId, setLibEditId] = useState<string | null>(null);
 
   // Owner-only site background + auction sounds — separate from any single
   // room's background, persists on the server until the owner changes it again.
@@ -273,7 +278,13 @@ export default function App() {
 
   useEffect(() => {
     const s = io(SERVER, { transports: ["websocket", "polling"] });
-    s.on("connect", () => setMyId(s.id || ""));
+    s.on("connect", () => {
+      setMyId(s.id || "");
+      // The free server sleeps and forgets who was signed in. When it wakes up and the
+      // socket reconnects, quietly sign in again with the Google token we already have.
+      const cred = (window as any).__auctionGoogleCred;
+      if (cred) s.emit("googleSignIn", { idToken: cred });
+    });
     s.on("state", (x: AuctionState) => {
       setState(x);
       // Only move screens if the player is inside a room screen; if they chose to go
@@ -285,6 +296,7 @@ export default function App() {
       if (x.phase === "LOBBY") setScreen((prev) => (prev === "results" ? "lobby" : prev));
     });
     s.on("siteConfig", (cfg: SiteConfig) => setSiteConfigState(cfg));
+    s.on("library", (d: { characters: Character[]; selection: string[] | null }) => { setLibrary(d.characters || []); setDefaultSel(d.selection || null); });
     s.on("authResult", (r: { ok: boolean; email?: string; name?: string; reason?: string }) => {
       if (r.ok) {
         setAuthed(true); setAuthEmail(r.email || ""); setAuthName(r.name || ""); setAuthError("");
@@ -318,7 +330,7 @@ export default function App() {
       if (g?.accounts?.id && googleBtnRef.current) {
         g.accounts.id.initialize({
           client_id: GOOGLE_CLIENT_ID,
-          callback: (resp: { credential: string }) => { socket?.emit("googleSignIn", { idToken: resp.credential }); },
+          callback: (resp: { credential: string }) => { (window as any).__auctionGoogleCred = resp.credential; socket?.emit("googleSignIn", { idToken: resp.credential }); },
         });
         googleBtnRef.current.innerHTML = "";
         g.accounts.id.renderButton(googleBtnRef.current, { theme: "filled_black", size: "large", shape: "pill", text: "signin_with" });
@@ -345,6 +357,17 @@ export default function App() {
   }, []);
 
   useEffect(() => { mutedRef.current = muted; }, [muted]);
+
+  // Host in the lobby: load the character library so they can tick which characters play.
+  useEffect(() => {
+    if (socket && authed && screen === "lobby" && me?.isHost) socket.emit("getLibrary");
+  }, [socket, authed, screen, me?.isHost]);
+
+  // Keep the ticked list in step with what is actually in the room.
+  const roomCharIds = state?.characters.map((c) => c.id).join("|") || "";
+  useEffect(() => {
+    if (state) setPick(state.characters.map((c) => c.id));
+  }, [roomCharIds]);
 
   // Fade the ambient hum (or owner-uploaded music) in/out with mute, without restarting it.
   useEffect(() => {
@@ -439,7 +462,7 @@ export default function App() {
     const names = Array.from({ length: teamCount }, (_, i) => teamNames[i] || `Team ${i + 1}`);
     socket?.emit("createRoom", {
       name: name || "Host", title, mode, budget, bidIncrement: increment, timerMax: timer,
-      teamNames: names, characters: demoCharacters, limits: limitsDraft,
+      teamNames: names, limits: limitsDraft,
     });
     setScreen("lobby");
   }
@@ -556,6 +579,66 @@ export default function App() {
     socket?.emit("updateCharacters", [...state.characters, newChar]);
     setCharDraft(blankDraft(state.limits));
     flash(`${newChar.name} added to the auction pool.`);
+  }
+
+  // ---- Character library helpers ----
+  // Everything the host can tick: the library plus any room-only characters added by hand.
+  const pickable: Character[] = useMemo(() => {
+    const ids = new Set(library.map((c) => c.id));
+    const roomOnly = (state?.characters || []).filter((c) => !ids.has(c.id));
+    return [...library, ...roomOnly];
+  }, [library, state?.characters]);
+  const needCount = state ? Math.min(state.limits.maxCharacters, pickable.length) : 0;
+  const pickDirty = state ? pick.join("|") !== state.characters.map((c) => c.id).join("|") : false;
+  const customIds = new Set(library.filter((c) => !demoCharacters.some((d) => d.id === c.id)).map((c) => c.id));
+
+  function togglePick(id: string) {
+    if (!state) return;
+    if (pick.includes(id)) return setPick(pick.filter((x) => x !== id));
+    if (pick.length >= state.limits.maxCharacters) return flash(`Limit is ${state.limits.maxCharacters} — untick one first.`);
+    setPick([...pick, id]);
+  }
+  function applyPick() {
+    if (!state) return;
+    socket?.emit("selectCharacters", { ids: pick });
+    flash(`${pick.length} character${pick.length === 1 ? "" : "s"} set for this auction.`);
+  }
+  function saveDefaultPick() {
+    if (!state) return;
+    if (!ownerKey.trim()) return flash("Enter the owner key (Site Settings) to save for all rooms.");
+    socket?.emit("selectCharacters", { ids: pick });
+    socket?.emit("saveDefaultSelection", { key: ownerKey.trim(), ids: pick });
+    flash("Saved — new rooms will start with this list.");
+  }
+  async function saveToLibrary(imageFile: File | null) {
+    if (!state) return;
+    if (!ownerKey.trim()) return flash("Enter the owner key (Site Settings) to save characters permanently.");
+    if (!charDraft.name.trim()) return flash("Give the character a name.");
+    const image = imageFile ? await fileToDataUrl(imageFile) : charDraft.image;
+    const power = Math.min(state.limits.maxPower, Math.max(1, charDraft.power));
+    const basePrice = Math.min(state.limits.maxValue, Math.max(state.limits.minValue, charDraft.basePrice));
+    socket?.emit("libraryUpsert", {
+      key: ownerKey.trim(),
+      character: {
+        id: libEditId || undefined, name: charDraft.name.trim(), universe: charDraft.universe.trim() || "Custom",
+        basePrice, power, popularity: power, rarity: charDraft.rarity, abilityNote: charDraft.abilityNote.trim(), image,
+      },
+    });
+    flash(libEditId ? "Library character updated." : `${charDraft.name.trim()} saved to the permanent library.`);
+    setCharDraft(blankDraft(state.limits));
+    setLibEditId(null);
+    setManagerTab("pick");
+  }
+  function editLibraryCharacter(c: Character) {
+    setLibEditId(c.id);
+    setCharDraft({ name: c.name, universe: c.universe, abilityNote: c.abilityNote || "", power: c.power, basePrice: c.basePrice, rarity: c.rarity, image: c.image });
+    setManagerTab("add");
+  }
+  function deleteLibraryCharacter(c: Character) {
+    if (!ownerKey.trim()) return flash("Enter the owner key (Site Settings) to delete from the library.");
+    if (!window.confirm(`Delete ${c.name} from the permanent library?`)) return;
+    socket?.emit("libraryDelete", { key: ownerKey.trim(), id: c.id });
+    setPick((p) => p.filter((x) => x !== c.id));
   }
 
   function startEdit(c: Character) {
@@ -830,12 +913,54 @@ export default function App() {
               </p>
             </div>
             <div className="tabbar">
+              <button className={managerTab === "pick" ? "tab active" : "tab"} onClick={() => setManagerTab("pick")}><Library size={14} /> Pick ({state.characters.length}/{state.limits.maxCharacters})</button>
               <button className={managerTab === "add" ? "tab active" : "tab"} onClick={() => setManagerTab("add")}><Plus size={14} /> Add</button>
               <button className={managerTab === "limits" ? "tab active" : "tab"} onClick={() => setManagerTab("limits")}><SlidersHorizontal size={14} /> Limits</button>
               <button className={managerTab === "theme" ? "tab active" : "tab"} onClick={() => setManagerTab("theme")}><Image size={14} /> Theme</button>
               <button className={managerTab === "list" ? "tab active" : "tab"} onClick={() => setManagerTab("list")}><Users size={14} /> Roster ({state.characters.length})</button>
             </div>
           </div>
+
+          {managerTab === "pick" && (
+            <div className="pick-panel">
+              <p className="muted small">
+                Tick the characters that play in this auction — pick {needCount} (the limit is {state.limits.maxCharacters}). Characters you add by hand are kept in the library for good; use “Save for all rooms” so every new room starts with this exact list.
+              </p>
+              <div className="pick-bar">
+                <b className={pick.length === needCount ? "pick-count ok" : "pick-count"}>{pick.length} / {needCount} selected</b>
+                <button className="ghost" onClick={() => setPick(pickable.slice(0, state.limits.maxCharacters).map((c) => c.id))}>Select first {Math.min(state.limits.maxCharacters, pickable.length)}</button>
+                <button className="ghost" onClick={() => setPick([])}>Clear</button>
+                <button className="secondary" onClick={applyPick} disabled={!pickDirty}><Check size={16} /> APPLY TO THIS AUCTION</button>
+                <button className="primary" onClick={saveDefaultPick}><Check size={16} /> SAVE FOR ALL ROOMS</button>
+              </div>
+              {pickDirty && <p className="warn"><ShieldAlert size={14} /> You changed the ticks — press Apply (or Save for all rooms) or they won't count.</p>}
+              {defaultSel && <p className="muted small">Saved default list: {defaultSel.length} characters.</p>}
+              <div className="pick-grid">
+                {pickable.map((c) => {
+                  const on = pick.includes(c.id);
+                  return (
+                    <div key={c.id} className={on ? "pick-card on" : "pick-card"} onClick={() => togglePick(c.id)}>
+                      <div className="pick-check">{on ? <Check size={14} /> : null}</div>
+                      <div className="char-thumb">{c.image ? <img src={c.image} alt={c.name} /> : <div className="initial">{c.name[0]}</div>}</div>
+                      <div className="char-meta">
+                        <b>{c.name}</b>
+                        <span className="muted">{c.universe} • {c.rarity}</span>
+                        <div className="stat-row"><span>Power {c.power}</span><span>{money(c.basePrice)}</span></div>
+                        {!library.some((l) => l.id === c.id) && <span className="tag-room">this room only</span>}
+                      </div>
+                      {customIds.has(c.id) && (
+                        <div className="char-actions" onClick={(e) => e.stopPropagation()}>
+                          <button className="icon" onClick={() => editLibraryCharacter(c)}><Pencil size={16} /></button>
+                          <button className="icon danger" onClick={() => deleteLibraryCharacter(c)}><Trash2 size={16} /></button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              <p className="muted small">New characters: open the Add tab and press “SAVE PERMANENTLY TO LIBRARY”.</p>
+            </div>
+          )}
 
           {managerTab === "add" && (
             <div className="char-form">
@@ -870,9 +995,13 @@ export default function App() {
                   {RARITIES.map((r) => <option key={r}>{r}</option>)}
                 </select>
               </label>
-              <button className="primary full" onClick={() => addCharacter(null)}
+              <button className="primary full" onClick={() => saveToLibrary(null)}>
+                <Library /> {libEditId ? "SAVE CHANGES TO LIBRARY" : "SAVE PERMANENTLY TO LIBRARY"}
+              </button>
+              {libEditId && <button className="ghost full" onClick={() => { setLibEditId(null); setCharDraft(blankDraft(state.limits)); }}><X size={16} /> Cancel editing</button>}
+              <button className="secondary full" onClick={() => addCharacter(null)}
                 disabled={state.characters.length >= state.limits.maxCharacters}>
-                <Plus /> ADD TO AUCTION POOL
+                <Plus /> ADD TO THIS AUCTION ONLY
               </button>
               {state.characters.length >= state.limits.maxCharacters && (
                 <p className="warn"><ShieldAlert size={14} /> Character limit reached — remove one or raise the limit in the Limits tab.</p>

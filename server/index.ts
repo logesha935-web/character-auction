@@ -37,17 +37,124 @@ const SITE_MEDIA_FIELDS: SiteMediaField[] = ["background", "backgroundVideo", "b
 const SITE_VIDEO_MAX_BYTES = 18_000_000;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const SITE_CONFIG_PATH = path.join(__dirname, "site-config.json");
+
+// --------------------------------------------------------------------------------
+// PERMANENT STORAGE. Render's free server wipes its own disk on every redeploy /
+// restart / sleep, so anything written next to this file disappears. To keep your
+// wallpapers, sounds, character images and approved accounts "until you change
+// them", they are saved in a Supabase Storage bucket (free) when these two env vars
+// are set on Render:  SUPABASE_URL  and  SUPABASE_SERVICE_KEY  (bucket name defaults
+// to "auction-data", override with SUPABASE_BUCKET). Without them it falls back to
+// the local data/ folder (fine for your own laptop, NOT permanent on Render).
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
+const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "auction-data";
+const REMOTE_STORE = !!(SUPABASE_URL && SUPABASE_KEY);
+const LOCAL_DIR = path.join(__dirname, "data");
+const safeName = (n: string) => n.replace(/[^a-zA-Z0-9_.-]/g, "_");
+const sbHeaders = (extra: Record<string, string> = {}) => ({ Authorization: `Bearer ${SUPABASE_KEY}`, apikey: SUPABASE_KEY, ...extra });
+
+async function storePut(name: string, value: string): Promise<void> {
+  const key = safeName(name);
+  try {
+    if (REMOTE_STORE) {
+      const r = await fetch(`${SUPABASE_URL}/storage/v1/object/${SUPABASE_BUCKET}/${key}`, {
+        method: "POST", headers: sbHeaders({ "x-upsert": "true", "Content-Type": "text/plain" }), body: value,
+      });
+      if (!r.ok) console.error(`[store] save ${key} failed: ${r.status} ${await r.text().catch(() => "")}`);
+    } else {
+      fs.mkdirSync(LOCAL_DIR, { recursive: true });
+      fs.writeFileSync(path.join(LOCAL_DIR, key), value);
+    }
+  } catch (e) { console.error(`[store] save ${key} error`, e); }
+}
+async function storeGet(name: string): Promise<string | null> {
+  const key = safeName(name);
+  try {
+    if (REMOTE_STORE) {
+      const r = await fetch(`${SUPABASE_URL}/storage/v1/object/${SUPABASE_BUCKET}/${key}`, { headers: sbHeaders() });
+      if (!r.ok) return null;
+      return await r.text();
+    }
+    const f = path.join(LOCAL_DIR, key);
+    return fs.existsSync(f) ? fs.readFileSync(f, "utf-8") : null;
+  } catch { return null; }
+}
+async function storeDelete(name: string): Promise<void> {
+  const key = safeName(name);
+  try {
+    if (REMOTE_STORE) await fetch(`${SUPABASE_URL}/storage/v1/object/${SUPABASE_BUCKET}/${key}`, { method: "DELETE", headers: sbHeaders() });
+    else { const f = path.join(LOCAL_DIR, key); if (fs.existsSync(f)) fs.unlinkSync(f); }
+  } catch { /* non-fatal */ }
+}
+async function ensureBucket() {
+  if (!REMOTE_STORE) return;
+  try {
+    await fetch(`${SUPABASE_URL}/storage/v1/bucket`, {
+      method: "POST", headers: sbHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ id: SUPABASE_BUCKET, name: SUPABASE_BUCKET, public: false, file_size_limit: 50 * 1024 * 1024 }),
+    }); // "already exists" is fine
+  } catch { /* ignore */ }
+}
+
 let siteConfig: SiteConfig = {};
-try {
-  if (fs.existsSync(SITE_CONFIG_PATH)) {
-    const raw = JSON.parse(fs.readFileSync(SITE_CONFIG_PATH, "utf-8"));
-    for (const field of SITE_MEDIA_FIELDS) siteConfig[field] = raw?.[field] || undefined;
+// Owner-set picture per character id (kept until the owner changes it again), and the
+// host-set default room background for new rooms.
+let charImages: Record<string, string> = {};
+let roomBackgroundDefault: string | undefined;
+function saveSiteConfigField(field: SiteMediaField) {
+  const v = siteConfig[field];
+  return v ? storePut(`site-${field}.txt`, v) : storeDelete(`site-${field}.txt`);
+}
+async function saveCharImage(id: string, image: string | undefined) {
+  if (image) charImages[id] = image; else delete charImages[id];
+  if (image) await storePut(`charimg-${id}.txt`, image); else await storeDelete(`charimg-${id}.txt`);
+  await storePut("charimg-index.json", JSON.stringify(Object.keys(charImages)));
+}
+function withSavedImages(list: Character[]): Character[] {
+  return list.map((c) => (!c.image && charImages[c.id] ? { ...c, image: charImages[c.id] } : c));
+}
+
+// --------------------------------------------------------------------------------
+// CHARACTER LIBRARY — every built-in character plus every character the owner adds by
+// hand. Manually added characters live here PERMANENTLY (Supabase) until the owner
+// deletes them. The host then ticks which ones go into each auction (up to the limit),
+// and the owner can save that ticked list as the default for all future rooms.
+// Images of custom characters are stored through charImages (charimg-<id>.txt), so the
+// library file itself stays small.
+let customLibrary: Character[] = [];
+let defaultSelection: string[] | null = null;
+const LIB_LIMITS: CharacterLimits = { maxCharacters: 1000, minValue: 0, maxValue: 1_000_000_000, maxPower: 100 };
+function saveLibrary() {
+  const slim = customLibrary.map((c) => ({ ...c, image: undefined }));
+  return storePut("char-library.json", JSON.stringify(slim));
+}
+function saveDefaultSelection() {
+  return defaultSelection ? storePut("char-selection.json", JSON.stringify(defaultSelection)) : storeDelete("char-selection.json");
+}
+function fullLibrary(): Character[] {
+  return withSavedImages([...demoCharacters, ...customLibrary]);
+}
+function libraryPayload() {
+  return { characters: fullLibrary(), selection: defaultSelection };
+}
+function sendLibraryToWatchers() {
+  const payload = libraryPayload();
+  for (const [, sk] of io.sockets.sockets) if (sk.data.wantsLibrary) sk.emit("library", payload);
+}
+// Characters for a brand-new room: the owner's saved default list if there is one,
+// otherwise the first ones in the library.
+function initialCharacters(limits: CharacterLimits): Character[] {
+  const lib = fullLibrary();
+  if (defaultSelection && defaultSelection.length) {
+    const picked = defaultSelection.map((id) => lib.find((c) => c.id === id)).filter(Boolean) as Character[];
+    if (picked.length) return sanitizeCharacterList(picked, limits);
   }
-} catch { /* ignore corrupt/missing config */ }
-function saveSiteConfig() {
-  try { fs.writeFileSync(SITE_CONFIG_PATH, JSON.stringify(siteConfig)); }
-  catch { /* non-fatal — settings just won't survive a restart */ }
+  return sanitizeCharacterList(lib, limits);
+}
+// How many characters the host must pick before the auction can start.
+function requiredCount(limits: CharacterLimits): number {
+  return Math.min(limits.maxCharacters, fullLibrary().length);
 }
 
 // --------------------------------------------------------------------------------
@@ -60,19 +167,41 @@ function saveSiteConfig() {
 const GOOGLE_CLIENT_ID = process.env.AUCTION_GOOGLE_CLIENT_ID || "787395401483-p8ltdpr8kqsvgbq0u9bm10df3b4ofg4l.apps.googleusercontent.com";
 const OWNER_EMAIL = (process.env.AUCTION_OWNER_EMAIL || "you@gmail.com").toLowerCase();
 const oauthClient = new OAuth2Client(GOOGLE_CLIENT_ID);
-const ALLOWED_EMAILS_PATH = path.join(__dirname, "allowed-emails.json");
-let allowedEmails: string[] = [];
-try {
-  if (fs.existsSync(ALLOWED_EMAILS_PATH)) {
-    allowedEmails = JSON.parse(fs.readFileSync(ALLOWED_EMAILS_PATH, "utf-8"));
-  } else {
-    allowedEmails = [OWNER_EMAIL];
-  }
-} catch { allowedEmails = [OWNER_EMAIL]; }
-function saveAllowedEmails() {
-  try { fs.writeFileSync(ALLOWED_EMAILS_PATH, JSON.stringify(allowedEmails)); }
-  catch { /* non-fatal */ }
+let allowedEmails: string[] = [OWNER_EMAIL];
+// Optional: AUCTION_ALLOWED_EMAILS="a@gmail.com,b@gmail.com" on Render always keeps these approved.
+const SEED_EMAILS = (process.env.AUCTION_ALLOWED_EMAILS || "").split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
+function saveAllowedEmails() { return storePut("allowed-emails.json", JSON.stringify(allowedEmails)); }
+
+// Load everything saved earlier. Runs at start-up; sign-in and owner actions wait for it.
+async function loadPersisted() {
+  await ensureBucket();
+  const fields: SiteMediaField[] = SITE_MEDIA_FIELDS;
+  await Promise.all(fields.map(async (f) => { const v = await storeGet(`site-${f}.txt`); if (v) siteConfig[f] = v; }));
+  try {
+    const raw = await storeGet("allowed-emails.json");
+    const stored: string[] = raw ? JSON.parse(raw) : [];
+    allowedEmails = Array.from(new Set([OWNER_EMAIL, ...SEED_EMAILS, ...stored.map((e) => String(e).toLowerCase())]));
+  } catch { allowedEmails = Array.from(new Set([OWNER_EMAIL, ...SEED_EMAILS])); }
+  try {
+    const idx = await storeGet("charimg-index.json");
+    const ids: string[] = idx ? JSON.parse(idx) : [];
+    await Promise.all(ids.map(async (id) => { const v = await storeGet(`charimg-${id}.txt`); if (v) charImages[id] = v; }));
+  } catch { /* ignore */ }
+  try {
+    const rawLib = await storeGet("char-library.json");
+    const parsed: Partial<Character>[] = rawLib ? JSON.parse(rawLib) : [];
+    customLibrary = parsed.map((c, i) => clampCharacter(c, LIB_LIMITS, `lib-${i}`));
+  } catch { customLibrary = []; }
+  try {
+    const rawSel = await storeGet("char-selection.json");
+    const ids = rawSel ? JSON.parse(rawSel) : null;
+    defaultSelection = Array.isArray(ids) ? ids.map(String) : null;
+  } catch { defaultSelection = null; }
+  roomBackgroundDefault = (await storeGet("room-background.txt")) || undefined;
+  console.log(`[store] ${REMOTE_STORE ? "Supabase" : "LOCAL DISK (not permanent on Render!)"} — loaded ${Object.keys(siteConfig).length} site files, ${allowedEmails.length} approved accounts, ${Object.keys(charImages).length} character images, ${customLibrary.length} library characters`);
 }
+const persistReady: Promise<void> = loadPersisted().catch((e) => console.error("[store] load failed", e));
+persistReady.then(() => { io.emit("siteConfig", siteConfig); });
 function isApprovedEmail(email: string | undefined | null): boolean {
   if (!email) return false;
   return allowedEmails.includes(email.toLowerCase());
@@ -198,20 +327,22 @@ io.on("connection", socket=>{
   // this is independent of any room and applies to the landing page / auction page.
   socket.emit("siteConfig", siteConfig);
 
-  socket.on("setSiteConfig", (data:{key:string; field:SiteMediaField; value:string})=>{
+  socket.on("setSiteConfig", async (data:{key:string; field:SiteMediaField; value:string})=>{
+    await persistReady;
     if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage","Incorrect owner key.");
     if (!SITE_MEDIA_FIELDS.includes(data.field)) return;
     if (typeof data.value !== "string") return;
     const limit = data.field === "backgroundVideo" ? SITE_VIDEO_MAX_BYTES : 8_000_000;
     if (data.value.length > limit) return socket.emit("errorMessage","That file is too large — try a smaller one.");
     siteConfig = { ...siteConfig, [data.field]: data.value || undefined };
-    saveSiteConfig();
     io.emit("siteConfig", siteConfig); // broadcast to everyone, everywhere, live
+    await saveSiteConfigField(data.field); // permanent — survives restarts/redeploys
   });
 
   // --- Google Sign-In -----------------------------------------------------------
   socket.on("googleSignIn", async (data: { idToken: string }) => {
     try {
+      await persistReady;
       const ticket = await oauthClient.verifyIdToken({ idToken: data?.idToken, audience: GOOGLE_CLIENT_ID });
       const payload = ticket.getPayload();
       const email = payload?.email?.toLowerCase();
@@ -229,21 +360,24 @@ io.on("connection", socket=>{
   });
 
   // --- Owner-managed approved-accounts list (needs the owner key, not Google auth) ---
-  socket.on("listAllowedEmails", (data: { key: string }) => {
+  socket.on("listAllowedEmails", async (data: { key: string }) => {
+    await persistReady;
     if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage", "Incorrect owner key.");
     socket.emit("allowedEmailsList", allowedEmails);
   });
-  socket.on("addAllowedEmail", (data: { key: string; email: string }) => {
+  socket.on("addAllowedEmail", async (data: { key: string; email: string }) => {
+    await persistReady;
     if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage", "Incorrect owner key.");
     const email = (data.email || "").trim().toLowerCase();
     if (!email || !email.includes("@")) return socket.emit("errorMessage", "Enter a valid email address.");
-    if (!allowedEmails.includes(email)) { allowedEmails.push(email); saveAllowedEmails(); }
+    if (!allowedEmails.includes(email)) { allowedEmails.push(email); await saveAllowedEmails(); }
     socket.emit("allowedEmailsList", allowedEmails);
   });
-  socket.on("removeAllowedEmail", (data: { key: string; email: string }) => {
+  socket.on("removeAllowedEmail", async (data: { key: string; email: string }) => {
+    await persistReady;
     if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage", "Incorrect owner key.");
     allowedEmails = allowedEmails.filter((e) => e !== (data.email || "").toLowerCase());
-    saveAllowedEmails();
+    await saveAllowedEmails();
     socket.emit("allowedEmailsList", allowedEmails);
   });
 
@@ -269,10 +403,10 @@ io.on("connection", socket=>{
     }
     const hostTeam = teams[0];
     const player:Player={id:socket.id,name:cfg.name||"Host",teamId:hostTeam.id,connected:true,isHost:true};
-    const characters = sanitizeCharacterList(cfg.characters?.length?cfg.characters:demoCharacters, limits);
+    const characters = initialCharacters(limits);
     const state:AuctionState={
       roomCode:code, title:cfg.title||"Character Auction", mode, phase:"LOBBY",
-      players:[player], teams, characters, limits, background:undefined,
+      players:[player], teams, characters, limits, background:roomBackgroundDefault,
       round:1, unsoldQueue:[], finalUnsold:[],
       currentIndex:0, currentBid:0, currentBidderTeamId:null, currentBidderPlayerId:null, currentBidderName:null,
       bidIncrement:Math.max(1,cfg.bidIncrement||1000),
@@ -353,6 +487,8 @@ io.on("connection", socket=>{
     if(!s || !p?.isHost) return socket.emit("errorMessage","Only the host can start.");
     if(s.phase!=="LOBBY") return;
     if(!s.characters.length) return socket.emit("errorMessage","Add at least one character before starting.");
+    const need = requiredCount(s.limits);
+    if(s.characters.length < need) return socket.emit("errorMessage",`Select ${need} characters first (you have ${s.characters.length}/${need}).`);
     unsoldCountsByRoom.set(room, new Map());
     s.phase="BIDDING"; s.round=1; s.unsoldQueue=[]; s.finalUnsold=[];
     s.currentIndex=0; s.currentBid=s.characters[0].basePrice; s.currentBidderTeamId=null; s.currentBidderPlayerId=null; s.currentBidderName=null; s.timer=s.timerMax;
@@ -420,7 +556,7 @@ io.on("connection", socket=>{
     if(characters.length > s.limits.maxCharacters){
       socket.emit("errorMessage",`Limit is ${s.limits.maxCharacters} characters — extra entries were dropped.`);
     }
-    s.characters = sanitizeCharacterList(characters, s.limits);
+    s.characters = withSavedImages(sanitizeCharacterList(characters, s.limits));
     emit(room);
   });
 
@@ -432,6 +568,8 @@ io.on("connection", socket=>{
     if(typeof dataUrl !== "string") return;
     if(dataUrl.length > 6_000_000) return socket.emit("errorMessage","Background image is too large — try a smaller file.");
     s.background = dataUrl || undefined;
+    roomBackgroundDefault = s.background; // new rooms start with the last background you set
+    if (s.background) void storePut("room-background.txt", s.background); else void storeDelete("room-background.txt");
     emit(room);
   });
 
@@ -440,7 +578,8 @@ io.on("connection", socket=>{
   // not the per-room host key — so only you can do this from your own device.
   // Whatever is set here stays on that character (in every room using it) until
   // you change it again; nothing else about the character is touched.
-  socket.on("setCharacterImage",(data:{key:string; characterId:string; image:string})=>{
+  socket.on("setCharacterImage",async (data:{key:string; characterId:string; image:string})=>{
+    await persistReady;
     if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage","Incorrect owner key.");
     const room=socket.data.room; const s=rooms.get(room);
     if(!s) return socket.emit("errorMessage","You're not in a room.");
@@ -450,6 +589,75 @@ io.on("connection", socket=>{
     if(!char) return socket.emit("errorMessage","Character not found.");
     char.image = data.image || undefined;
     emit(room);
+    await saveCharImage(char.id, char.image); // permanent — used by every future room too
+  });
+
+  // --- Character library + host selection ---------------------------------------
+  socket.on("getLibrary", async () => {
+    if (!requireAuth(socket)) return;
+    await persistReady;
+    socket.data.wantsLibrary = true;
+    socket.emit("library", libraryPayload());
+  });
+
+  // Host: choose exactly which characters go into THIS auction (ids, in order).
+  // Characters already in the room keep any edits; others come from the library.
+  socket.on("selectCharacters", (data: { ids: string[] }) => {
+    if (!requireAuth(socket)) return;
+    const room=socket.data.room; const s=rooms.get(room);
+    const p=s?.players.find(x=>x.id===socket.id);
+    if(!s || !p?.isHost || s.phase!=="LOBBY") return;
+    if(!data || !Array.isArray(data.ids)) return;
+    if(data.ids.length > s.limits.maxCharacters) socket.emit("errorMessage",`Limit is ${s.limits.maxCharacters} characters — extra picks were dropped.`);
+    const lib = fullLibrary();
+    const seen = new Set<string>();
+    const picked: Character[] = [];
+    for (const id of data.ids.map(String)) {
+      if (seen.has(id)) continue; seen.add(id);
+      const c = s.characters.find(x=>x.id===id) || lib.find(x=>x.id===id);
+      if (c) picked.push(c);
+    }
+    s.characters = withSavedImages(sanitizeCharacterList(picked, s.limits));
+    emit(room);
+  });
+
+  // Owner: save the current pick as the default for every future room, until changed.
+  socket.on("saveDefaultSelection", async (data: { key: string; ids: string[] }) => {
+    await persistReady;
+    if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage","Incorrect owner key.");
+    if (!Array.isArray(data.ids)) return;
+    const valid = new Set(fullLibrary().map(c=>c.id));
+    defaultSelection = Array.from(new Set(data.ids.map(String))).filter(id=>valid.has(id));
+    await saveDefaultSelection();
+    sendLibraryToWatchers();
+  });
+
+  // Owner: add / edit / delete characters in the permanent library.
+  socket.on("libraryUpsert", async (data: { key: string; character: Partial<Character> }) => {
+    await persistReady;
+    if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage","Incorrect owner key.");
+    const raw = data.character || {};
+    if (!String(raw.name||"").trim()) return socket.emit("errorMessage","Give the character a name.");
+    if (typeof raw.image === "string" && raw.image.length > 6_000_000) return socket.emit("errorMessage","That image is too large — try a smaller one.");
+    const id = raw.id && customLibrary.some(c=>c.id===raw.id) ? String(raw.id) : `lib-${Date.now()}-${randomBytes(2).toString("hex")}`;
+    const clean = clampCharacter({ ...raw, id }, LIB_LIMITS, id);
+    const idx = customLibrary.findIndex(c=>c.id===id);
+    if (idx >= 0) customLibrary[idx] = clean; else customLibrary.push(clean);
+    if (raw.image !== undefined) await saveCharImage(id, raw.image || undefined);
+    await saveLibrary();
+    sendLibraryToWatchers();
+    socket.emit("libraryAdded", { id });
+  });
+  socket.on("libraryDelete", async (data: { key: string; id: string }) => {
+    await persistReady;
+    if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage","Incorrect owner key.");
+    const before = customLibrary.length;
+    customLibrary = customLibrary.filter(c=>c.id!==data.id);
+    if (customLibrary.length === before) return socket.emit("errorMessage","Only characters you added yourself can be deleted.");
+    await saveCharImage(data.id, undefined);
+    if (defaultSelection) { defaultSelection = defaultSelection.filter(id=>id!==data.id); await saveDefaultSelection(); }
+    await saveLibrary();
+    sendLibraryToWatchers();
   });
 
   // Host-only: reset a finished room back to the lobby, same players/teams/roster/
