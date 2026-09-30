@@ -153,6 +153,23 @@ function registerMedia(dataUrl: string): string | undefined {
   return `/media/${hash}`;
 }
 async function flushMedia() { await Promise.all([...pendingMedia]); }
+// A save that failed (storage hiccup) used to be forgotten until the same file was uploaded again,
+// so the picture lived only in memory and vanished on the next restart. Retry every minute.
+setInterval(() => {
+  for (const [hash, m] of mediaMem) {
+    if (mediaPersisted.has(hash)) continue;
+    mediaPersisted.add(hash);
+    const p: Promise<void> = storePut(`media-${hash}.txt`, `data:${m.mime};base64,${m.buf.toString("base64")}`)
+      .then((ok) => { if (!ok) mediaPersisted.delete(hash); }).finally(() => { pendingMedia.delete(p); });
+    pendingMedia.add(p);
+  }
+}, 60_000).unref();
+// Tell the person who just uploaded if the file is NOT going to survive a restart.
+function warnIfNotPermanent(socket: any, url?: string) {
+  if (!REMOTE_STORE) { socket.emit("errorMessage", "Saved on the server's temporary disk only — set SUPABASE_URL and SUPABASE_SERVICE_KEY on Render or it is lost on restart."); return; }
+  const m = url ? MEDIA_URL_RE.exec(url) : null;
+  if (m && !mediaPersisted.has(m[1])) socket.emit("errorMessage", "Upload is live, but permanent storage did not accept it yet — the server keeps retrying.");
+}
 // Turns whatever the browser sent into the one form we store: /media/<hash>.
 function normalizeImage(v: unknown): string | undefined {
   if (typeof v !== "string" || !v) return undefined;
@@ -345,16 +362,20 @@ async function saveAllowedEmails() { if (!persistHealthy) return; await storePut
 // (sessions, approved accounts, library, rooms) are read with error detection: if
 // storage is unreachable we retry every 5 s and MERGE, and refuse to overwrite the
 // saved lists until they have really been read (persistHealthy).
-async function loadSiteFiles() {
+async function loadSiteFiles(): Promise<boolean> {
+  let ok = true;
   await Promise.all(SITE_MEDIA_FIELDS.map(async (f) => {
-    const v = await storeGet(`site-${f}.txt`);
-    if (!v) return;
+    const r = await storeGetSafe(`site-${f}.txt`);
+    if (r.error) { ok = false; return; } // storage unreachable: retried later instead of staying empty until the next restart
+    const v = r.value;
+    if (!v || siteConfig[f]) return;
     const m = MEDIA_URL_RE.exec(v);
     const norm = v.startsWith("data:") ? registerMedia(v) : m ? `/media/${m[1]}` : undefined;
     if (!norm) return;
     siteConfig[f] = norm;
     if (v.startsWith("data:")) { await flushMedia(); await storePut(`site-${f}.txt`, norm); } // one-time upgrade of old saves
   }));
+  return ok;
 }
 async function loadCritical(isRetry: boolean): Promise<boolean> {
   let ok = true;
@@ -434,14 +455,15 @@ function scheduleCriticalRetry() {
   if (criticalRetry) return;
   criticalRetry = setTimeout(async () => {
     criticalRetry = null;
-    const ok = await loadCritical(true).catch(() => false);
-    if (ok) console.log("[store] storage recovered"); else scheduleCriticalRetry();
+    const siteOk = await loadSiteFiles().catch(() => false);
+    const ok = (await loadCritical(true).catch(() => false)) && siteOk;
+    if (ok) { console.log("[store] storage recovered"); io.emit("siteConfig", siteConfig); } else scheduleCriticalRetry();
   }, 5000);
 }
 async function loadPersisted() {
   await ensureBucket();
-  await loadSiteFiles();
-  const ok = await loadCritical(false);
+  const siteOk = await loadSiteFiles().catch(() => false);
+  const ok = (await loadCritical(false)) && siteOk;
   if (!ok) { console.error("[store] could not read some saved data yet — will keep retrying, and will not overwrite it"); scheduleCriticalRetry(); }
   console.log(`[store] ${REMOTE_STORE ? "Supabase" : "LOCAL DISK (not permanent on Render!)"} — loaded ${Object.keys(siteConfig).length} site files, ${allowedEmails.length} approved accounts, ${Object.keys(sessions).length} sessions, ${Object.keys(charImages).length} character images, ${customLibrary.length} library characters, ${rooms.size} open rooms`);
 }
@@ -542,14 +564,20 @@ function concludeCurrent(room:string, sold:boolean){
   stopTimer(room);
   const character=s.characters[s.currentIndex];
   if(!character) return;
+  let awarded=false;
   if(sold && s.currentBidderTeamId){
-    const team=s.teams.find(t=>t.id===s.currentBidderTeamId);
+    // Team ids are unique, but fall back to the bidder's own team just in case.
+    const team=s.teams.find(t=>t.id===s.currentBidderTeamId)
+      || s.teams.find(t=>!!s.currentBidderPlayerId && t.members.includes(s.currentBidderPlayerId));
     if(team){
+      const won=clone(character);
       team.spent += s.currentBid;
-      team.roster.push(character);
-      s.history.push({ character, teamId: team.id, amount: s.currentBid, playerId: s.currentBidderPlayerId || undefined, playerName: s.currentBidderName || undefined });
+      team.roster.push(won);
+      s.history.push({ character: won, teamId: team.id, amount: s.currentBid, playerId: s.currentBidderPlayerId || undefined, playerName: s.currentBidderName || undefined });
+      awarded=true;
     }
-  } else {
+  }
+  if(!awarded){
     const counts = unsoldCountsByRoom.get(room) || new Map<string, number>();
     const timesUnsold = (counts.get(character.id) || 0) + 1;
     counts.set(character.id, timesUnsold);
@@ -557,7 +585,8 @@ function concludeCurrent(room:string, sold:boolean){
     if (timesUnsold === 1) s.unsoldQueue.push(character);
     else s.finalUnsold.push(character);
   }
-  advanceAuction(room);
+  advanceAuction(room); // broadcasts the new roster / counts to every client
+  if(awarded) void persistRooms(); // save the sale right away so a restart can't lose it
 }
 
 function advanceAuction(room:string){
@@ -649,6 +678,7 @@ io.on("connection", socket=>{
     siteConfig = { ...siteConfig, [data.field]: norm };
     io.emit("siteConfig", siteConfig); // broadcast to everyone, everywhere, live
     await saveSiteConfigField(data.field); // permanent — survives restarts/redeploys
+    warnIfNotPermanent(socket, norm);
   });
 
   // --- Google Sign-In -----------------------------------------------------------
@@ -820,8 +850,10 @@ io.on("connection", socket=>{
     let team:Team|undefined;
     if(s.mode === "SOLO"){
       if(s.teams.length >= MAX_SOLO_PLAYERS) return socket.emit("errorMessage","Room is full.");
+      let n = s.teams.length + 1;
+      while (s.teams.some((t) => t.id === `t${n}`)) n++; // ids must stay unique even after a seat was removed
       team = {
-        id:`t${s.teams.length+1}`, name:data.name?.trim() || `Player ${s.teams.length+1}`,
+        id:`t${n}`, name:data.name?.trim() || `Player ${s.teams.length+1}`,
         members:[], budget:s.teams[0]?.budget || 100000, spent:0, roster:[], color:colors[s.teams.length % colors.length]
       };
       s.teams.push(team);
@@ -952,6 +984,7 @@ io.on("connection", socket=>{
     emit(room);
     await flushMedia();
     if (norm) await storePut("room-background.txt", norm); else await storeDelete("room-background.txt");
+    warnIfNotPermanent(socket, norm);
   });
 
   // Owner-only: change one character's picture from the auction page itself, any
@@ -974,6 +1007,7 @@ io.on("connection", socket=>{
     emit(room);
     await saveCharImage(char.id, url); // permanent — used by every future room too
     sendLibraryToWatchers();
+    warnIfNotPermanent(socket, url);
   });
 
   // --- Character library + host selection ---------------------------------------
@@ -1032,6 +1066,7 @@ io.on("connection", socket=>{
     if (raw.image !== undefined) await saveCharImage(id, clean.image);
     await saveLibrary();
     sendLibraryToWatchers();
+    if (raw.image !== undefined) warnIfNotPermanent(socket, clean.image);
     socket.emit("libraryAdded", { id });
   });
   socket.on("libraryDelete", async (data: { key: string; id: string }) => {

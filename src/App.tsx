@@ -204,6 +204,29 @@ function playCustomOneShot(url: string, volume: number) {
   } catch { /* ignore malformed audio */ }
 }
 
+// Final-reveal card: the picture fills the whole card (full-bleed), and the details sit on a
+// gradient at the bottom. `index` staggers the entrance so the cards reveal one after another.
+function RevealCard({ c, price, index }: { c: Character; price: number; index: number }) {
+  return (
+    <div className="reveal-card" style={{ "--d": `${Math.min(index, 12) * 0.14}s` } as CSSProperties}>
+      <div className="reveal-media">
+        {c.image ? <img src={c.image} alt={c.name} /> : <div className="reveal-initial">{c.name[0]}</div>}
+      </div>
+      <div className="reveal-shine" />
+      <div className="reveal-info">
+        <span className="reveal-universe">{c.universe} • {c.rarity}</span>
+        <span className="reveal-name">{c.name}</span>
+        {c.abilityNote && <span className="reveal-note">{c.abilityNote}</span>}
+        <div className="reveal-stats">
+          <span><span className="rs-label">Power</span><span className="rs-val">{c.power}</span></span>
+          <span><span className="rs-label">Base</span><span className="rs-val">{money(c.basePrice)}</span></span>
+          <span className="rs-sold"><span className="rs-label">Sold</span><span className="rs-val">{money(price)}</span></span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Small round character icon used to show what a player has bought.
 function MiniIcon({ c, size = 26 }: { c: Character; size?: number }) {
   return (
@@ -327,6 +350,24 @@ export default function App() {
     };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  // A picture/video that fails to load (free server still waking up, network blip) is retried a
+  // few times instead of staying broken until the page is reloaded.
+  useEffect(() => {
+    const onErr = (e: Event) => {
+      const el = e.target;
+      if (!(el instanceof HTMLImageElement || el instanceof HTMLVideoElement)) return;
+      const src = el.getAttribute("src") || "";
+      if (!src.includes("/media/")) return;
+      const n = Number(el.dataset.retry || 0);
+      if (n >= 5) return;
+      el.dataset.retry = String(n + 1);
+      const base = src.replace(/[?&]r=\d+$/, "");
+      setTimeout(() => el.setAttribute("src", base + (base.includes("?") ? "&" : "?") + "r=" + (n + 1)), 1500 * (n + 1));
+    };
+    window.addEventListener("error", onErr, true);
+    return () => window.removeEventListener("error", onErr, true);
   }, []);
 
   useEffect(() => {
@@ -567,6 +608,8 @@ export default function App() {
     });
     setScreen("lobby");
   }
+  // Landing page: pick the mode first, then go to the lobby (whose setup form uses it).
+  function startNew(m: GameMode) { setMode(m); setScreen("lobby"); }
   function join() {
     socket?.emit("joinRoom", { roomCode: room.trim().toUpperCase(), name: name || "Player" });
     setScreen("lobby");
@@ -905,12 +948,20 @@ export default function App() {
         </div>
       )}
       <section className="hero">
-        <small>REAL-TIME • MULTI-DEVICE • TEAM MODE</small>
+        <small>REAL-TIME • MULTI-DEVICE • TEAM OR SOLO</small>
         <h1>THE<br /><i>CHARACTER</i><br />AUCTION</h1>
         <p>Every friend joins from their own phone. Play as teams with a shared wallet, or go solo and bid head-to-head against your friends. Fully custom character roster — your images, your ability notes, your power scores, your value limits, your background.</p>
-        <button className="primary" onClick={() => setScreen(state?.phase === "BIDDING" ? "auction" : state?.phase === "COMPLETE" ? "results" : "lobby")}>
-          <Gavel /> {state?.phase === "BIDDING" ? "RETURN TO AUCTION" : state?.phase === "COMPLETE" ? "VIEW RESULTS" : "CREATE / JOIN GAME"}
-        </button>
+        {state ? (
+          <button className="primary" onClick={() => setScreen(state.phase === "BIDDING" ? "auction" : state.phase === "COMPLETE" ? "results" : "lobby")}>
+            <Gavel /> {state.phase === "BIDDING" ? "RETURN TO AUCTION" : state.phase === "COMPLETE" ? "VIEW RESULTS" : "BACK TO LOBBY"}
+          </button>
+        ) : (
+          <div className="hero-modes">
+            <button className="primary" onClick={() => startNew("TEAM")}><Users /> TEAM GAME</button>
+            <button className="primary" onClick={() => startNew("SOLO")}><User /> SOLO GAME</button>
+            <button className="secondary" onClick={() => setScreen("lobby")}>JOIN WITH CODE</button>
+          </div>
+        )}
         <div className="hero-tags">
           <span><Sparkles size={14} /> Custom characters</span>
           <span><Users size={14} /> Team or solo mode</span>
@@ -967,7 +1018,7 @@ export default function App() {
                 </>
               ) : (
                 <p className="muted small solo-note">
-                  Every friend who joins automatically gets their own individual wallet — great for head-to-head bidding wars, no pre-set teams needed.
+                  Play on your own, or let friends join — everyone gets their own individual wallet, no pre-set teams needed.
                 </p>
               )}
             </>
@@ -1278,7 +1329,12 @@ export default function App() {
                 );
               })}
               <strong>{money(t.budget - t.spent)}</strong>
-              <small>{t.roster.length} won</small>
+              <small className="team-count" key={t.roster.length}>{t.roster.length} won</small>
+              {t.roster.length > 0 && (
+                <div className="pb-icons team-roster">
+                  {t.roster.map((c, i) => <MiniIcon key={`${c.id}-${i}`} c={c} size={22} />)}
+                </div>
+              )}
             </div>
           ))}
         </aside>
@@ -1424,11 +1480,7 @@ export default function App() {
                   <div className="won-grid">
                     {won.length === 0 && <span className="muted small">Nothing won.</span>}
                     {won.map((h, i) => (
-                      <div className="won-card legendary-glow" key={i} style={{ animationDelay: `${i * 0.12}s` }}>
-                        <MiniIcon c={h.character} size={44} />
-                        <span>{h.character.name}</span>
-                        <small>{money(h.amount)} • P{h.character.power}</small>
-                      </div>
+                      <RevealCard key={i} c={h.character} price={h.amount} index={i} />
                     ))}
                   </div>
                 </div>
