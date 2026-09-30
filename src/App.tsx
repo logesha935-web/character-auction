@@ -23,6 +23,55 @@ const money = (n: number) =>
 
 const RARITIES = ["Common", "Rare", "Epic", "Legendary", "Custom"];
 
+// ------------------------------------------------------------------------------
+// Browser-side persistence helpers (all wrapped: private mode / blocked storage must
+// never crash the app).
+const SESSION_KEY = "auction.session.v1";     // long-lived login token, cleared only on Logout
+const OWNERKEY_KEY = "auction.ownerKey.v1";   // owner key remembered on THIS device, cleared on Logout
+const PROFILE_PREFIX = "auction.profile.v1."; // per-account settings cache (server copy is authoritative)
+const lsGet = (k: string): string | null => { try { return window.localStorage.getItem(k); } catch { return null; } };
+const lsSet = (k: string, v: string) => { try { window.localStorage.setItem(k, v); } catch { /* ignore */ } };
+const lsDel = (k: string) => { try { window.localStorage.removeItem(k); } catch { /* ignore */ } };
+
+// ------------------------------------------------------------------------------
+// Media. The server stores every upload once and only ever sends short "/media/<hash>"
+// links; here they become full URLs. Character pictures you drop into
+// src/assets/characters/ (named c1.png, c2.jpg … or iron-man.png — the character id or the
+// name in lowercase-with-dashes) are bundled into the site at build time, so they ship
+// with the website itself and can never disappear. An owner-uploaded picture always
+// wins over a bundled one.
+const bundledFiles = import.meta.glob("./assets/characters/*.{png,jpg,jpeg,webp,gif,svg,avif}", { eager: true, query: "?url", import: "default" }) as Record<string, string>;
+const bundledByKey: Record<string, string> = {};
+for (const [file, url] of Object.entries(bundledFiles)) {
+  bundledByKey[(file.split("/").pop() || "").replace(/\.[^.]+$/, "").toLowerCase()] = url;
+}
+const bundledUrls = new Set(Object.values(bundledByKey));
+const slug = (t: string) => t.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+const mediaUrl = (u?: string): string | undefined => (u && u.startsWith("/media/") ? SERVER + u : u);
+function resolveChar(c: Character): Character {
+  const image = mediaUrl(c.image) || bundledByKey[String(c.id).toLowerCase()] || bundledByKey[slug(c.name)];
+  return image === c.image ? c : { ...c, image };
+}
+function resolveState(s: AuctionState): AuctionState {
+  return {
+    ...s,
+    background: mediaUrl(s.background),
+    characters: s.characters.map(resolveChar),
+    unsoldQueue: s.unsoldQueue.map(resolveChar),
+    finalUnsold: s.finalUnsold.map(resolveChar),
+    teams: s.teams.map((t) => ({ ...t, roster: t.roster.map(resolveChar) })),
+    history: s.history.map((h) => ({ ...h, character: resolveChar(h.character) })),
+  };
+}
+function resolveSite(cfg: SiteConfig): SiteConfig {
+  const out: SiteConfig = {};
+  for (const [k, v] of Object.entries(cfg || {})) (out as Record<string, string | undefined>)[k] = mediaUrl(v as string | undefined);
+  return out;
+}
+// Bundled pictures are added on this side only — never send them back to the server.
+const cleanImg = (img?: string) => (img && !bundledUrls.has(img) ? img : undefined);
+const outChars = (list: Character[]) => list.map((c) => ({ ...c, image: cleanImg(c.image) }));
+
 type CharacterDraft = {
   name: string;
   universe: string;
@@ -196,12 +245,16 @@ export default function App() {
   // room's background, persists on the server until the owner changes it again.
   const [siteConfig, setSiteConfigState] = useState<SiteConfig>({});
   const [showSiteSettings, setShowSiteSettings] = useState(false);
-  const [ownerKey, setOwnerKey] = useState("");
+  const [ownerKey, setOwnerKey] = useState(() => lsGet(OWNERKEY_KEY) || "");
   const [allowedEmailsList, setAllowedEmailsListState] = useState<string[]>([]);
   const [newEmailInput, setNewEmailInput] = useState("");
 
   // Google Sign-In gate — nothing else in the app renders until this is true.
-  const [authed, setAuthed] = useState(false);
+  // "restoring" = a saved login exists and we are checking it — show a loading screen, never the login page.
+  const [authStatus, setAuthStatus] = useState<"restoring" | "out" | "in">(() => (lsGet(SESSION_KEY) ? "restoring" : "out"));
+  const authed = authStatus === "in";
+  const [slowRestore, setSlowRestore] = useState(false);
+  const profileLoaded = useRef(false);
   const [authEmail, setAuthEmail] = useState("");
   const [authName, setAuthName] = useState("");
   const [authError, setAuthError] = useState("");
@@ -280,12 +333,31 @@ export default function App() {
     const s = io(SERVER, { transports: ["websocket", "polling"] });
     s.on("connect", () => {
       setMyId(s.id || "");
-      // The free server sleeps and forgets who was signed in. When it wakes up and the
-      // socket reconnects, quietly sign in again with the Google token we already have.
-      const cred = (window as any).__auctionGoogleCred;
-      if (cred) s.emit("googleSignIn", { idToken: cred });
+      // Every (re)connect — page load, wifi blip, free server waking up — quietly resumes the
+      // saved login. That also re-seats us in the room we were in.
+      const tok = lsGet(SESSION_KEY);
+      if (tok) s.emit("resumeSession", { token: tok });
     });
-    s.on("state", (x: AuctionState) => {
+    const applyProfile = (p: any) => {
+      if (!p || typeof p !== "object") return;
+      if (typeof p.name === "string") setName(p.name);
+      if (typeof p.title === "string" && p.title) setTitle(p.title);
+      if (typeof p.budget === "number") setBudget(p.budget);
+      if (typeof p.increment === "number") setIncrement(p.increment);
+      if (typeof p.timer === "number") setTimer(p.timer);
+      if (typeof p.teamCount === "number") setTeamCount(p.teamCount);
+      if (Array.isArray(p.teamNames) && p.teamNames.length) setTeamNames(p.teamNames.map(String));
+      if (p.mode === "SOLO" || p.mode === "TEAM") setMode(p.mode);
+      if (p.limits && typeof p.limits === "object") setLimitsDraft((prev) => ({ ...prev, ...p.limits }));
+    };
+    s.on("profile", (p: any) => { applyProfile(p); profileLoaded.current = true; });
+    s.on("resumedRoom", (d: { roomCode: string; phase: AuctionState["phase"] }) => {
+      setRoom(d.roomCode);
+      setScreen(d.phase === "BIDDING" ? "auction" : d.phase === "COMPLETE" ? "results" : "lobby");
+    });
+    s.on("loggedOut", () => { /* local cleanup already done by logout() */ });
+    s.on("state", (raw: AuctionState) => {
+      const x = resolveState(raw);
       setState(x);
       // Only move screens if the player is inside a room screen; if they chose to go
       // Home (Back button), don't yank them back on every timer tick.
@@ -295,16 +367,25 @@ export default function App() {
       // results screen back into the lobby to start the next round.
       if (x.phase === "LOBBY") setScreen((prev) => (prev === "results" ? "lobby" : prev));
     });
-    s.on("siteConfig", (cfg: SiteConfig) => setSiteConfigState(cfg));
-    s.on("library", (d: { characters: Character[]; selection: string[] | null }) => { setLibrary(d.characters || []); setDefaultSel(d.selection || null); });
-    s.on("authResult", (r: { ok: boolean; email?: string; name?: string; reason?: string }) => {
+    s.on("siteConfig", (cfg: SiteConfig) => setSiteConfigState(resolveSite(cfg)));
+    s.on("library", (d: { characters: Character[]; selection: string[] | null }) => { setLibrary((d.characters || []).map(resolveChar)); setDefaultSel(d.selection || null); });
+    s.on("authResult", (r: { ok: boolean; email?: string; name?: string; reason?: string; sessionToken?: string }) => {
       if (r.ok) {
-        setAuthed(true); setAuthEmail(r.email || ""); setAuthName(r.name || ""); setAuthError("");
+        if (r.sessionToken) lsSet(SESSION_KEY, r.sessionToken); // first Google sign-in on this device: remember it
+        setAuthEmail(r.email || ""); setAuthName(r.name || ""); setAuthError("");
+        const cached = r.email ? lsGet(PROFILE_PREFIX + r.email) : null; // instant, before the server copy arrives
+        if (cached) { try { applyProfile(JSON.parse(cached)); } catch { /* ignore */ } }
+        setAuthStatus("in");
+      } else if (r.reason === "server_error") {
+        // Server/storage not ready yet — keep the saved login and try again shortly.
+        setTimeout(() => { const t = lsGet(SESSION_KEY); if (t) s.emit("resumeSession", { token: t }); }, 4000);
       } else {
-        setAuthed(false);
+        if (r.reason === "session_expired" || r.reason === "not_allowed") lsDel(SESSION_KEY);
+        setAuthStatus("out");
         setAuthError(
           r.reason === "not_allowed"
             ? `${r.email || "This Google account"} isn't approved yet. Ask the host to add it.`
+            : r.reason === "session_expired" ? ""
             : "Sign-in failed — please try again."
         );
       }
@@ -321,7 +402,7 @@ export default function App() {
   // Render Google's own Sign-In button once its script has loaded and the
   // sign-in gate is showing. Polls briefly since the script tag is async.
   useEffect(() => {
-    if (authed) return;
+    if (authStatus !== "out") return;
     let cancelled = false;
     let tries = 0;
     const tryInit = () => {
@@ -341,7 +422,7 @@ export default function App() {
     };
     tryInit();
     return () => { cancelled = true; };
-  }, [authed, socket]);
+  }, [authStatus, socket]);
 
   // Browsers won't play audio until a user gesture — this "unlocks" it on the
   // very first tap/click/keypress anywhere in the app (typing a name, hitting
@@ -357,6 +438,26 @@ export default function App() {
   }, []);
 
   useEffect(() => { mutedRef.current = muted; }, [muted]);
+
+  // While a saved login is being restored, say so if the (free) server is slow to wake up.
+  useEffect(() => {
+    if (authStatus !== "restoring") { setSlowRestore(false); return; }
+    const t = setTimeout(() => setSlowRestore(true), 8000);
+    return () => clearTimeout(t);
+  }, [authStatus]);
+
+  // Remember the owner key on this device (cleared on Logout).
+  useEffect(() => { if (ownerKey) lsSet(OWNERKEY_KEY, ownerKey); else lsDel(OWNERKEY_KEY); }, [ownerKey]);
+
+  // Save this account's settings (name, room settings, limits) — on the server (follows the
+  // Google account) and in this browser as an instant cache.
+  useEffect(() => {
+    if (!authed || !socket || !profileLoaded.current) return;
+    const settings = { name, title, budget, increment, timer, teamCount, teamNames, mode, limits: limitsDraft };
+    lsSet(PROFILE_PREFIX + authEmail, JSON.stringify(settings));
+    const t = setTimeout(() => socket.emit("saveProfile", { settings }), 800);
+    return () => clearTimeout(t);
+  }, [authed, socket, authEmail, name, title, budget, increment, timer, teamCount, teamNames, mode, limitsDraft]);
 
   // Host in the lobby: load the character library so they can tick which characters play.
   useEffect(() => {
@@ -500,6 +601,18 @@ export default function App() {
     if (!me?.isHost) return flash("Only the host can start a new round.");
     socket?.emit("resetRoom");
   }
+  // Logout is the ONLY thing that clears the saved login.
+  function logout() {
+    if (!window.confirm("Log out on this device?")) return;
+    socket?.emit("logout", { token: lsGet(SESSION_KEY) });
+    lsDel(SESSION_KEY); lsDel(OWNERKEY_KEY);
+    try { (window as any).google?.accounts?.id?.disableAutoSelect(); } catch { /* ignore */ }
+    (window as any).__auctionGoogleCred = undefined;
+    profileLoaded.current = false;
+    setOwnerKey(""); setLibrary([]); setState(null); setRoom(""); setShowSiteSettings(false);
+    setScreen("home"); setAuthEmail(""); setAuthName(""); setAuthError("");
+    setAuthStatus("out");
+  }
   // Just steps back to the home screen, same as the browser Back button — the
   // room and your seat in it are untouched, so "Return to auction" still works.
   function exitGame() {
@@ -558,7 +671,7 @@ export default function App() {
         image,
       });
     }
-    socket?.emit("updateCharacters", [...state.characters, ...added]);
+    socket?.emit("updateCharacters", outChars([...state.characters, ...added]));
   }
 
   async function addCharacter(imageFile: File | null) {
@@ -576,7 +689,7 @@ export default function App() {
       basePrice, power, popularity: power,
       rarity: charDraft.rarity, abilityNote: charDraft.abilityNote.trim(), image,
     };
-    socket?.emit("updateCharacters", [...state.characters, newChar]);
+    socket?.emit("updateCharacters", outChars([...state.characters, newChar]));
     setCharDraft(blankDraft(state.limits));
     flash(`${newChar.name} added to the auction pool.`);
   }
@@ -621,7 +734,7 @@ export default function App() {
       key: ownerKey.trim(),
       character: {
         id: libEditId || undefined, name: charDraft.name.trim(), universe: charDraft.universe.trim() || "Custom",
-        basePrice, power, popularity: power, rarity: charDraft.rarity, abilityNote: charDraft.abilityNote.trim(), image,
+        basePrice, power, popularity: power, rarity: charDraft.rarity, abilityNote: charDraft.abilityNote.trim(), image: cleanImg(image),
       },
     });
     flash(libEditId ? "Library character updated." : `${charDraft.name.trim()} saved to the permanent library.`);
@@ -662,16 +775,29 @@ export default function App() {
             abilityNote: editDraft.abilityNote.trim(), image }
         : c
     );
-    socket?.emit("updateCharacters", next);
+    socket?.emit("updateCharacters", outChars(next));
     setEditingId(null);
     setEditDraft(null);
   }
 
   function removeCharacter(id: string) {
     if (!state) return;
-    socket?.emit("updateCharacters", state.characters.filter((c) => c.id !== id));
+    socket?.emit("updateCharacters", outChars(state.characters.filter((c) => c.id !== id)));
     if (editingId === id) { setEditingId(null); setEditDraft(null); }
   }
+
+  // ---------------------------------------------------------------- RESTORING SAVED LOGIN
+  if (authStatus === "restoring") return (
+    <main className="signin-gate">
+      <div className="signin-card">
+        <b>◆ CHARACTER AUCTION</b>
+        <h1>SIGNING YOU IN…</h1>
+        <div className="spinner" aria-hidden="true" />
+        <p className="muted">{slowRestore ? "The server is waking up — on the free plan this can take up to a minute. Your login is safe, just wait a moment." : "Restoring your saved login…"}</p>
+        {slowRestore && <button className="ghost" onClick={() => { lsDel(SESSION_KEY); setAuthStatus("out"); }}>Sign in with Google again instead</button>}
+      </div>
+    </main>
+  );
 
   // ---------------------------------------------------------------- SIGN-IN GATE
   if (!authed) return (
@@ -698,6 +824,7 @@ export default function App() {
         <button className="site-settings-trigger" title="Site owner settings" onClick={() => setShowSiteSettings((v) => !v)}>
           <Settings size={16} />
         </button>
+        <button className="logout-btn" title="Log out" onClick={logout}><LogOut size={14} /> Logout</button>
       </div>
       {showSiteSettings && (
         <div className="site-settings-panel">

@@ -1,6 +1,7 @@
 node_modules/
 dist/
 *.tsbuildinfo
+.env
+server/data/
 server/site-config.json
 server/allowed-emails.json
-.env

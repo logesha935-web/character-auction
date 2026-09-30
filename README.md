@@ -1,3 +1,13 @@
+# UPDATE NOTES - persistence
+
+* Stay signed in until you press Logout (session token in localStorage, restored before the login page can show).
+* Refresh or reopen the browser: you return to your room and seat automatically.
+* Uploads (wallpaper, video, sounds, character images) are permanent and served from /media/<hash>.
+* Built-in character pictures: put files in src/assets/characters/ (see README.txt there).
+* Permanent storage needs SUPABASE_URL + SUPABASE_SERVICE_KEY on Render. See CHANGES.md.
+
+---
+
 # Character Auction — Team Multiplayer v9
 
 This version adds:
@@ -104,8 +114,3 @@ In the host lobby, scroll to **Character manager**:
 Images are stored in the current room's memory as data URLs and shared with all connected players.
 
 For a large production game, replace this with cloud object storage so rooms survive restarts and images don't make the Socket.IO payload too large.
-#   c h a r a c t e r - a u c t i o n  
- #   c h a r a c t e r - a u c t i o n  
- #   c h a r a c t e r - a u c t i o n  
- #   c h a r a c t e r - a u c t i o n  
- 

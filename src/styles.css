@@ -670,3 +670,9 @@ button svg{vertical-align:-3px; margin-right:6px;}
 .pick-check{width:22px; height:22px; flex:0 0 22px; border-radius:6px; border:2px solid var(--border); display:grid; place-items:center; color:#fff;}
 .pick-card.on .pick-check{background:var(--red); border-color:var(--red);}
 .tag-room{font-size:11px; opacity:.7;}
+
+/* ---- login restore spinner + logout button ---- */
+.spinner{width:34px; height:34px; margin:14px auto; border-radius:50%; border:3px solid var(--border); border-top-color:var(--red); animation:spin .9s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg);}}
+.logout-btn{display:inline-flex; align-items:center; gap:6px; background:transparent; border:1px solid var(--border); color:inherit; border-radius:99px; padding:6px 12px; cursor:pointer; font:inherit; font-size:13px;}
+.logout-btn:hover{border-color:var(--red);}

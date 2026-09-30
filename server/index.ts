@@ -5,7 +5,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { Server } from "socket.io";
-import { randomBytes } from "crypto";
+import { randomBytes, createHash } from "crypto";
 import { OAuth2Client } from "google-auth-library";
 import { AuctionState, Character, CharacterLimits, GameMode, Player, SiteConfig, SiteMediaField, Team } from "../src/types";
 import { demoCharacters, defaultLimits } from "../src/data";
@@ -21,6 +21,10 @@ const timers = new Map<string, NodeJS.Timeout>();
 const unsoldCountsByRoom = new Map<string, Map<string, number>>();
 // One entry per Google account per room: room code -> (email -> player socket id).
 const emailsByRoom = new Map<string, Map<string, string>>();
+// Per-room bookkeeping that survives a server restart (saved in rooms.json).
+const roomActivity = new Map<string, number>();
+const originalCharacters = new Map<string, Character[]>();
+const ROOM_IDLE_MS = 12 * 60 * 60 * 1000;
 const MAX_ROUNDS = 5;
 const MAX_SOLO_PLAYERS = 12;
 
@@ -54,19 +58,37 @@ const LOCAL_DIR = path.join(__dirname, "data");
 const safeName = (n: string) => n.replace(/[^a-zA-Z0-9_.-]/g, "_");
 const sbHeaders = (extra: Record<string, string> = {}) => ({ Authorization: `Bearer ${SUPABASE_KEY}`, apikey: SUPABASE_KEY, ...extra });
 
-async function storePut(name: string, value: string): Promise<void> {
+async function storePut(name: string, value: string): Promise<boolean> {
   const key = safeName(name);
   try {
     if (REMOTE_STORE) {
       const r = await fetch(`${SUPABASE_URL}/storage/v1/object/${SUPABASE_BUCKET}/${key}`, {
         method: "POST", headers: sbHeaders({ "x-upsert": "true", "Content-Type": "text/plain" }), body: value,
       });
-      if (!r.ok) console.error(`[store] save ${key} failed: ${r.status} ${await r.text().catch(() => "")}`);
+      if (!r.ok) { console.error(`[store] save ${key} failed: ${r.status} ${await r.text().catch(() => "")}`); return false; }
     } else {
       fs.mkdirSync(LOCAL_DIR, { recursive: true });
       fs.writeFileSync(path.join(LOCAL_DIR, key), value);
     }
-  } catch (e) { console.error(`[store] save ${key} error`, e); }
+    return true;
+  } catch (e) { console.error(`[store] save ${key} error`, e); return false; }
+}
+// Like storeGet, but tells "file does not exist" apart from "storage is down / errored".
+// Used for the files that hold lists (sessions, approved accounts, library, rooms) so a
+// temporary Supabase hiccup at start-up can never be mistaken for an empty list and then
+// overwrite the real one.
+async function storeGetSafe(name: string): Promise<{ value: string | null; error: boolean }> {
+  const key = safeName(name);
+  try {
+    if (REMOTE_STORE) {
+      const r = await fetch(`${SUPABASE_URL}/storage/v1/object/${SUPABASE_BUCKET}/${key}`, { headers: sbHeaders() });
+      if (r.ok) return { value: await r.text(), error: false };
+      if (r.status >= 500 || r.status === 429 || r.status === 401 || r.status === 403) return { value: null, error: true };
+      return { value: null, error: false }; // 400/404 = not created yet
+    }
+    const f = path.join(LOCAL_DIR, key);
+    return { value: fs.existsSync(f) ? fs.readFileSync(f, "utf-8") : null, error: false };
+  } catch { return { value: null, error: true }; }
 }
 async function storeGet(name: string): Promise<string | null> {
   const key = safeName(name);
@@ -97,19 +119,157 @@ async function ensureBucket() {
   } catch { /* ignore */ }
 }
 
+// --------------------------------------------------------------------------------
+// MEDIA — every uploaded image / sound / video is stored ONCE, by content hash, in
+// permanent storage and served from /media/<hash> with a 1-year cache. The game state,
+// the site config and the library only ever hold that short URL — never a giant
+// base64 string — so nothing is re-sent every second, and a link never breaks after a
+// refresh, restart or redeploy. (Browser blob: URLs are rejected here on purpose.)
+const mediaMem = new Map<string, { mime: string; buf: Buffer }>();
+const mediaPersisted = new Set<string>();
+const pendingMedia = new Set<Promise<void>>();
+const MEDIA_MIME = /^(image|audio|video)\/[a-z0-9.+-]+$/i;
+const MEDIA_URL_RE = /\/media\/([a-f0-9]{20})(?:[?#].*)?$/;
+function parseDataUrl(v: string): { mime: string; b64: string } | null {
+  if (!v.startsWith("data:")) return null;
+  const i = v.indexOf(";base64,");
+  if (i < 0) return null;
+  const mime = v.slice(5, i).split(";")[0].toLowerCase();
+  if (!MEDIA_MIME.test(mime)) return null;
+  return { mime, b64: v.slice(i + 8) };
+}
+function registerMedia(dataUrl: string): string | undefined {
+  const parsed = parseDataUrl(dataUrl);
+  if (!parsed) return undefined;
+  const buf = Buffer.from(parsed.b64, "base64");
+  if (!buf.length) return undefined;
+  const hash = createHash("sha1").update(buf).digest("hex").slice(0, 20);
+  if (!mediaMem.has(hash)) mediaMem.set(hash, { mime: parsed.mime, buf });
+  if (!mediaPersisted.has(hash)) {
+    mediaPersisted.add(hash);
+    const p: Promise<void> = storePut(`media-${hash}.txt`, dataUrl).then((ok) => { if (!ok) mediaPersisted.delete(hash); }).finally(() => { pendingMedia.delete(p); });
+    pendingMedia.add(p);
+  }
+  return `/media/${hash}`;
+}
+async function flushMedia() { await Promise.all([...pendingMedia]); }
+// Turns whatever the browser sent into the one form we store: /media/<hash>.
+function normalizeImage(v: unknown): string | undefined {
+  if (typeof v !== "string" || !v) return undefined;
+  if (v.startsWith("data:")) return registerMedia(v);
+  const m = MEDIA_URL_RE.exec(v);
+  if (m) return `/media/${m[1]}`;
+  return undefined; // blob:, bundled-asset paths and foreign URLs are never stored
+}
+app.get("/media/:hash", async (req, res) => {
+  try {
+    const hash = String(req.params.hash || "");
+    if (!/^[a-f0-9]{20}$/.test(hash)) return void res.status(404).end();
+    let m = mediaMem.get(hash);
+    if (!m) {
+      const { value } = await storeGetSafe(`media-${hash}.txt`);
+      const parsed = value ? parseDataUrl(value) : null;
+      if (parsed) { m = { mime: parsed.mime, buf: Buffer.from(parsed.b64, "base64") }; mediaMem.set(hash, m); mediaPersisted.add(hash); }
+    }
+    if (!m) return void res.status(404).end();
+    const size = m.buf.length;
+    res.set({
+      "Content-Type": m.mime, "Cache-Control": "public, max-age=31536000, immutable", "Accept-Ranges": "bytes",
+      "X-Content-Type-Options": "nosniff", "Cross-Origin-Resource-Policy": "cross-origin",
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+    });
+    const range = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ""));
+    if (range && (range[1] || range[2])) { // Safari/iOS will not play <video>/<audio> without Range support
+      let start = range[1] ? parseInt(range[1], 10) : NaN;
+      let end = range[2] ? parseInt(range[2], 10) : NaN;
+      if (Number.isNaN(start)) { start = Math.max(0, size - end); end = size - 1; }
+      else if (Number.isNaN(end) || end >= size) end = size - 1;
+      if (start > end || start >= size) { res.status(416).set("Content-Range", `bytes */${size}`).end(); return; }
+      res.status(206).set({ "Content-Range": `bytes ${start}-${end}/${size}`, "Content-Length": String(end - start + 1) });
+      res.end(m.buf.subarray(start, end + 1));
+      return;
+    }
+    res.set("Content-Length", String(size));
+    res.end(m.buf);
+  } catch (e) { console.error("[media] serve error", e); if (!res.headersSent) res.status(500).end(); }
+});
+
+// --------------------------------------------------------------------------------
+// LOGIN SESSIONS — after Google verifies you once, the server hands your browser its
+// own long-lived session token (kept in the browser's localStorage). On every page
+// load the app quietly resumes with that token, so you stay signed in across
+// refreshes, closing the browser and reopening, until you press Logout. Only a
+// SHA-256 hash of each token is stored server-side. Sessions last 1 year and renew
+// themselves whenever you use the app.
+const SESSION_TTL_MS = 365 * 24 * 60 * 60 * 1000;
+type Session = { email: string; name?: string; picture?: string; exp: number };
+let sessions: Record<string, Session> = {};
+const hashToken = (t: string) => createHash("sha256").update(t).digest("hex");
+function pruneSessions() {
+  const now = Date.now();
+  for (const [h, sess] of Object.entries(sessions)) if (!sess || sess.exp < now) delete sessions[h];
+}
+async function saveSessions() {
+  if (!persistHealthy) return; // never overwrite the saved list while storage is unreadable
+  pruneSessions();
+  await storePut("sessions.json", JSON.stringify(sessions));
+}
+async function createSession(email: string, name?: string, picture?: string): Promise<string> {
+  const token = randomBytes(32).toString("hex");
+  const mine = Object.entries(sessions).filter(([, x]) => x.email === email).sort((a, b) => a[1].exp - b[1].exp);
+  while (mine.length >= 20) { const [h] = mine.shift()!; delete sessions[h]; } // keep at most 20 devices per account
+  sessions[hashToken(token)] = { email, name, picture, exp: Date.now() + SESSION_TTL_MS };
+  await saveSessions();
+  return token;
+}
+function revokeSessionsFor(email: string) {
+  for (const [h, sess] of Object.entries(sessions)) if (sess.email === email) delete sessions[h];
+}
+
+// Per-account saved settings (name, room settings, limits) — follows the Google account,
+// not the device, so logging out and in (or using another phone) brings them back.
+const profileKey = (email: string) => `profile-${createHash("sha1").update(email.toLowerCase()).digest("hex").slice(0, 20)}.json`;
+function sanitizeProfile(raw: any) {
+  const str = (v: any, n: number) => (typeof v === "string" ? v.slice(0, n) : undefined);
+  const num = (v: any, lo: number, hi: number) => (Number.isFinite(Number(v)) ? Math.min(hi, Math.max(lo, Math.floor(Number(v)))) : undefined);
+  const out: any = {};
+  const name = str(raw?.name, 40); if (name !== undefined) out.name = name;
+  const title = str(raw?.title, 60); if (title !== undefined) out.title = title;
+  const budget = num(raw?.budget, 1000, 1_000_000_000); if (budget !== undefined) out.budget = budget;
+  const increment = num(raw?.increment, 1, 1_000_000_000); if (increment !== undefined) out.increment = increment;
+  const timer = num(raw?.timer, 5, 600); if (timer !== undefined) out.timer = timer;
+  const teamCount = num(raw?.teamCount, 2, 12); if (teamCount !== undefined) out.teamCount = teamCount;
+  if (Array.isArray(raw?.teamNames)) out.teamNames = raw.teamNames.slice(0, 12).map((n: any) => String(n ?? "").slice(0, 30));
+  if (raw?.mode === "SOLO" || raw?.mode === "TEAM") out.mode = raw.mode;
+  if (raw?.limits && typeof raw.limits === "object") out.limits = sanitizeLimits(raw.limits);
+  return out;
+}
+async function loadProfile(email: string) {
+  const { value } = await storeGetSafe(profileKey(email));
+  try { return value ? sanitizeProfile(JSON.parse(value)) : null; } catch { return null; }
+}
+
+let persistHealthy = false;
+
 let siteConfig: SiteConfig = {};
 // Owner-set picture per character id (kept until the owner changes it again), and the
 // host-set default room background for new rooms.
 let charImages: Record<string, string> = {};
 let roomBackgroundDefault: string | undefined;
-function saveSiteConfigField(field: SiteMediaField) {
+async function saveSiteConfigField(field: SiteMediaField) {
+  await flushMedia(); // make sure the file itself is stored before we save the pointer to it
   const v = siteConfig[field];
-  return v ? storePut(`site-${field}.txt`, v) : storeDelete(`site-${field}.txt`);
+  if (v) await storePut(`site-${field}.txt`, v); else await storeDelete(`site-${field}.txt`);
+}
+async function saveCharImageIndex() {
+  if (persistHealthy) await storePut("charimg-index.json", JSON.stringify(Object.keys(charImages)));
 }
 async function saveCharImage(id: string, image: string | undefined) {
-  if (image) charImages[id] = image; else delete charImages[id];
-  if (image) await storePut(`charimg-${id}.txt`, image); else await storeDelete(`charimg-${id}.txt`);
-  await storePut("charimg-index.json", JSON.stringify(Object.keys(charImages)));
+  const url = normalizeImage(image);
+  if (url) charImages[id] = url; else delete charImages[id];
+  await flushMedia();
+  if (url) await storePut(`charimg-${id}.txt`, url); else await storeDelete(`charimg-${id}.txt`);
+  await saveCharImageIndex();
 }
 function withSavedImages(list: Character[]): Character[] {
   return list.map((c) => (!c.image && charImages[c.id] ? { ...c, image: charImages[c.id] } : c));
@@ -125,12 +285,20 @@ function withSavedImages(list: Character[]): Character[] {
 let customLibrary: Character[] = [];
 let defaultSelection: string[] | null = null;
 const LIB_LIMITS: CharacterLimits = { maxCharacters: 1000, minValue: 0, maxValue: 1_000_000_000, maxPower: 100 };
-function saveLibrary() {
+async function saveLibrary() {
+  if (!persistHealthy) return;
   const slim = customLibrary.map((c) => ({ ...c, image: undefined }));
-  return storePut("char-library.json", JSON.stringify(slim));
+  await storePut("char-library.json", JSON.stringify(slim));
 }
-function saveDefaultSelection() {
-  return defaultSelection ? storePut("char-selection.json", JSON.stringify(defaultSelection)) : storeDelete("char-selection.json");
+async function saveDefaultSelection() {
+  if (!persistHealthy) return;
+  if (defaultSelection) await storePut("char-selection.json", JSON.stringify(defaultSelection)); else await storeDelete("char-selection.json");
+}
+// Owner actions that rewrite a saved list wait until storage has been read successfully.
+function storageReady(socket: any): boolean {
+  if (persistHealthy) return true;
+  socket.emit("errorMessage", "Storage is still waking up — try again in a few seconds.");
+  return false;
 }
 function fullLibrary(): Character[] {
   return withSavedImages([...demoCharacters, ...customLibrary]);
@@ -170,38 +338,144 @@ const oauthClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 let allowedEmails: string[] = [OWNER_EMAIL];
 // Optional: AUCTION_ALLOWED_EMAILS="a@gmail.com,b@gmail.com" on Render always keeps these approved.
 const SEED_EMAILS = (process.env.AUCTION_ALLOWED_EMAILS || "").split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
-function saveAllowedEmails() { return storePut("allowed-emails.json", JSON.stringify(allowedEmails)); }
+async function saveAllowedEmails() { if (!persistHealthy) return; await storePut("allowed-emails.json", JSON.stringify(allowedEmails)); }
 
 // Load everything saved earlier. Runs at start-up; sign-in and owner actions wait for it.
+// Site files / images are read first (each lives in its own file). The "list" files
+// (sessions, approved accounts, library, rooms) are read with error detection: if
+// storage is unreachable we retry every 5 s and MERGE, and refuse to overwrite the
+// saved lists until they have really been read (persistHealthy).
+async function loadSiteFiles() {
+  await Promise.all(SITE_MEDIA_FIELDS.map(async (f) => {
+    const v = await storeGet(`site-${f}.txt`);
+    if (!v) return;
+    const m = MEDIA_URL_RE.exec(v);
+    const norm = v.startsWith("data:") ? registerMedia(v) : m ? `/media/${m[1]}` : undefined;
+    if (!norm) return;
+    siteConfig[f] = norm;
+    if (v.startsWith("data:")) { await flushMedia(); await storePut(`site-${f}.txt`, norm); } // one-time upgrade of old saves
+  }));
+}
+async function loadCritical(isRetry: boolean): Promise<boolean> {
+  let ok = true;
+  const get = async (name: string) => { const r = await storeGetSafe(name); if (r.error) ok = false; return r.value; };
+  const lower = (arr: unknown[]) => arr.map((e) => String(e).toLowerCase());
+  try { // approved accounts
+    const raw = await get("allowed-emails.json");
+    const stored: string[] = raw ? JSON.parse(raw) : [];
+    allowedEmails = Array.from(new Set([...allowedEmails, OWNER_EMAIL, ...SEED_EMAILS, ...lower(stored)]));
+  } catch { /* corrupt file — keep defaults */ }
+  try { // login sessions
+    const raw = await get("sessions.json");
+    const stored = raw ? JSON.parse(raw) : {};
+    sessions = { ...stored, ...sessions };
+    pruneSessions();
+  } catch { /* ignore */ }
+  try { // owner-set character pictures
+    const idx = await get("charimg-index.json");
+    const ids: string[] = idx ? JSON.parse(idx) : [];
+    const upgrades: [string, string][] = [];
+    await Promise.all(ids.map(async (id) => {
+      const v = await get(`charimg-${id}.txt`);
+      if (!v || charImages[id]) return;
+      const m = MEDIA_URL_RE.exec(v);
+      const norm = v.startsWith("data:") ? registerMedia(v) : m ? `/media/${m[1]}` : undefined;
+      if (!norm) return;
+      charImages[id] = norm;
+      if (v.startsWith("data:")) upgrades.push([id, norm]);
+    }));
+    if (upgrades.length) { await flushMedia(); for (const [id, url] of upgrades) await storePut(`charimg-${id}.txt`, url); }
+  } catch { /* ignore */ }
+  try { // permanent character library
+    const raw = await get("char-library.json");
+    const parsed: Partial<Character>[] = raw ? JSON.parse(raw) : [];
+    for (const c of parsed) if (c?.id && !customLibrary.some((x) => x.id === c.id)) customLibrary.push(clampCharacter(c, LIB_LIMITS, String(c.id)));
+  } catch { /* ignore */ }
+  try { // saved default selection
+    const raw = await get("char-selection.json");
+    const ids = raw ? JSON.parse(raw) : null;
+    if (defaultSelection === null && Array.isArray(ids)) defaultSelection = ids.map(String);
+  } catch { /* ignore */ }
+  try { // room background used for new rooms
+    const raw = await get("room-background.txt");
+    if (raw && !roomBackgroundDefault) {
+      const m = MEDIA_URL_RE.exec(raw);
+      roomBackgroundDefault = raw.startsWith("data:") ? registerMedia(raw) : m ? `/media/${m[1]}` : undefined;
+      if (raw.startsWith("data:") && roomBackgroundDefault) { await flushMedia(); await storePut("room-background.txt", roomBackgroundDefault); }
+    }
+  } catch { /* ignore */ }
+  try { // rooms that were open before a restart — paused until somebody signs back in
+    const raw = await get("rooms.json");
+    const arr: any[] = raw ? JSON.parse(raw) : [];
+    const now = Date.now();
+    for (const r of arr) {
+      if (!r?.code || !r.state || rooms.has(r.code)) continue;
+      if (now - (r.active || 0) > ROOM_IDLE_MS) continue;
+      const st = r.state as AuctionState;
+      st.players.forEach((pl) => { pl.connected = false; });
+      rooms.set(r.code, st);
+      emailsByRoom.set(r.code, new Map(r.emails || []));
+      unsoldCountsByRoom.set(r.code, new Map(r.unsold || []));
+      if (Array.isArray(r.original)) originalCharacters.set(r.code, r.original);
+      roomActivity.set(r.code, r.active || now);
+    }
+  } catch { /* ignore */ }
+  if (ok) {
+    const wasUnhealthy = !persistHealthy;
+    persistHealthy = true;
+    if (isRetry && wasUnhealthy) { // write back anything created while storage was unreachable
+      await Promise.all([saveAllowedEmails(), saveSessions(), saveLibrary(), saveDefaultSelection(), saveCharImageIndex(), persistRooms()]);
+    }
+  }
+  return ok;
+}
+let criticalRetry: NodeJS.Timeout | null = null;
+function scheduleCriticalRetry() {
+  if (criticalRetry) return;
+  criticalRetry = setTimeout(async () => {
+    criticalRetry = null;
+    const ok = await loadCritical(true).catch(() => false);
+    if (ok) console.log("[store] storage recovered"); else scheduleCriticalRetry();
+  }, 5000);
+}
 async function loadPersisted() {
   await ensureBucket();
-  const fields: SiteMediaField[] = SITE_MEDIA_FIELDS;
-  await Promise.all(fields.map(async (f) => { const v = await storeGet(`site-${f}.txt`); if (v) siteConfig[f] = v; }));
-  try {
-    const raw = await storeGet("allowed-emails.json");
-    const stored: string[] = raw ? JSON.parse(raw) : [];
-    allowedEmails = Array.from(new Set([OWNER_EMAIL, ...SEED_EMAILS, ...stored.map((e) => String(e).toLowerCase())]));
-  } catch { allowedEmails = Array.from(new Set([OWNER_EMAIL, ...SEED_EMAILS])); }
-  try {
-    const idx = await storeGet("charimg-index.json");
-    const ids: string[] = idx ? JSON.parse(idx) : [];
-    await Promise.all(ids.map(async (id) => { const v = await storeGet(`charimg-${id}.txt`); if (v) charImages[id] = v; }));
-  } catch { /* ignore */ }
-  try {
-    const rawLib = await storeGet("char-library.json");
-    const parsed: Partial<Character>[] = rawLib ? JSON.parse(rawLib) : [];
-    customLibrary = parsed.map((c, i) => clampCharacter(c, LIB_LIMITS, `lib-${i}`));
-  } catch { customLibrary = []; }
-  try {
-    const rawSel = await storeGet("char-selection.json");
-    const ids = rawSel ? JSON.parse(rawSel) : null;
-    defaultSelection = Array.isArray(ids) ? ids.map(String) : null;
-  } catch { defaultSelection = null; }
-  roomBackgroundDefault = (await storeGet("room-background.txt")) || undefined;
-  console.log(`[store] ${REMOTE_STORE ? "Supabase" : "LOCAL DISK (not permanent on Render!)"} — loaded ${Object.keys(siteConfig).length} site files, ${allowedEmails.length} approved accounts, ${Object.keys(charImages).length} character images, ${customLibrary.length} library characters`);
+  await loadSiteFiles();
+  const ok = await loadCritical(false);
+  if (!ok) { console.error("[store] could not read some saved data yet — will keep retrying, and will not overwrite it"); scheduleCriticalRetry(); }
+  console.log(`[store] ${REMOTE_STORE ? "Supabase" : "LOCAL DISK (not permanent on Render!)"} — loaded ${Object.keys(siteConfig).length} site files, ${allowedEmails.length} approved accounts, ${Object.keys(sessions).length} sessions, ${Object.keys(charImages).length} character images, ${customLibrary.length} library characters, ${rooms.size} open rooms`);
 }
-const persistReady: Promise<void> = loadPersisted().catch((e) => console.error("[store] load failed", e));
+const persistReady: Promise<void> = loadPersisted().catch((e) => { console.error("[store] load failed", e); scheduleCriticalRetry(); });
 persistReady.then(() => { io.emit("siteConfig", siteConfig); });
+
+// --- Rooms survive restarts: saved (throttled) to rooms.json, restored on boot -------
+let persistTimer: NodeJS.Timeout | null = null;
+function schedulePersistRooms() {
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => { persistTimer = null; void persistRooms(); }, 4000);
+}
+async function persistRooms() {
+  if (!persistHealthy) return;
+  const out = [...rooms.entries()].map(([code, st]) => ({
+    code, state: st,
+    emails: [...(emailsByRoom.get(code)?.entries() || [])],
+    unsold: [...(unsoldCountsByRoom.get(code)?.entries() || [])],
+    original: originalCharacters.get(code) || null,
+    active: roomActivity.get(code) || Date.now(),
+  }));
+  await storePut("rooms.json", JSON.stringify(out));
+}
+// Drop rooms nobody has touched for 12 hours so memory and storage don't grow forever.
+setInterval(() => {
+  const now = Date.now();
+  for (const [code] of rooms) {
+    if (now - (roomActivity.get(code) || 0) > ROOM_IDLE_MS) {
+      stopTimer(code); rooms.delete(code); emailsByRoom.delete(code); unsoldCountsByRoom.delete(code);
+      originalCharacters.delete(code); roomActivity.delete(code);
+      schedulePersistRooms();
+    }
+  }
+}, 30 * 60 * 1000).unref();
 function isApprovedEmail(email: string | undefined | null): boolean {
   if (!email) return false;
   return allowedEmails.includes(email.toLowerCase());
@@ -217,12 +491,13 @@ const colors = ["#ff3b3b","#ffb454","#6ee7ff","#d9ff45","#ff7ab8","#b794ff","#62
 
 function roomCode(){ return randomBytes(3).toString("hex").toUpperCase(); }
 function clone<T>(v:T):T { return JSON.parse(JSON.stringify(v)); }
-function emit(room:string){ const s=rooms.get(room); if(s) io.to(room).emit("state",clone(s)); }
+function emit(room:string){ const s=rooms.get(room); if(s){ io.to(room).emit("state",clone(s)); roomActivity.set(room, Date.now()); schedulePersistRooms(); } }
 function stopTimer(room:string){ const t=timers.get(room); if(t){ clearInterval(t); timers.delete(room); } }
 
 function sanitizeLimits(raw:Partial<CharacterLimits> | undefined): CharacterLimits {
   const maxCharacters = Math.min(200, Math.max(2, Math.floor(Number(raw?.maxCharacters) || defaultLimits.maxCharacters)));
-  const minValue = Math.max(0, Math.floor(Number(raw?.minValue) ?? defaultLimits.minValue));
+  const rawMin = Number(raw?.minValue);
+  const minValue = Math.max(0, Math.floor(Number.isFinite(rawMin) ? rawMin : defaultLimits.minValue));
   const maxValue = Math.max(minValue + 1, Math.floor(Number(raw?.maxValue) || defaultLimits.maxValue));
   const maxPower = Math.min(100, Math.max(1, Math.floor(Number(raw?.maxPower) || defaultLimits.maxPower)));
   return { maxCharacters, minValue, maxValue, maxPower };
@@ -239,7 +514,7 @@ function clampCharacter(c: Partial<Character>, limits: CharacterLimits, fallback
     basePrice, power, popularity,
     rarity: (c.rarity || "Custom").toString().slice(0, 30),
     abilityNote: (c.abilityNote || "").toString().slice(0, 220),
-    image: c.image,
+    image: normalizeImage(c.image),
   };
 }
 
@@ -322,6 +597,41 @@ function advanceAuction(room:string){
   startTimer(room);
 }
 
+// After a successful sign-in / resume: send the saved profile and put the person back in the
+// room they were in (a refresh gives the browser a new socket id, so their seat is re-bound).
+async function afterAuth(socket: any, email: string) {
+  const prof = await loadProfile(email);
+  socket.emit("profile", prof);
+  rejoinRoom(socket, email);
+}
+function rejoinRoom(socket: any, email: string) {
+  const key = email.toLowerCase();
+  let best: { code: string; oldId: string } | null = null;
+  for (const [code, seen] of emailsByRoom) {
+    const oldId = seen.get(key); const st = rooms.get(code);
+    if (!oldId || !st || !st.players.some((x) => x.id === oldId)) continue;
+    if (!best || (roomActivity.get(code) || 0) > (roomActivity.get(best.code) || 0)) best = { code, oldId };
+  }
+  if (!best) return;
+  const { code, oldId } = best; const st = rooms.get(code)!;
+  if (oldId !== socket.id) {
+    const oldSock = io.sockets.sockets.get(oldId);
+    if (oldSock) { oldSock.leave(code); oldSock.data.room = undefined; } // same account opened in a second tab: latest one wins
+    const pl = st.players.find((x) => x.id === oldId)!;
+    pl.id = socket.id;
+    for (const tm of st.teams) tm.members = tm.members.map((id) => (id === oldId ? socket.id : id));
+    if (st.currentBidderPlayerId === oldId) st.currentBidderPlayerId = socket.id;
+    for (const h of st.history) if (h.playerId === oldId) h.playerId = socket.id;
+    emailsByRoom.get(code)!.set(key, socket.id);
+  }
+  const me = st.players.find((x) => x.id === socket.id)!;
+  me.connected = true;
+  socket.join(code); socket.data.room = code;
+  if (st.phase === "BIDDING" && !timers.has(code)) startTimer(code); // a restored room stays paused until someone is back
+  emit(code);
+  socket.emit("resumedRoom", { roomCode: code, phase: st.phase });
+}
+
 io.on("connection", socket=>{
   // Push the current owner-set site background + sounds to every new connection —
   // this is independent of any room and applies to the landing page / auction page.
@@ -334,7 +644,9 @@ io.on("connection", socket=>{
     if (typeof data.value !== "string") return;
     const limit = data.field === "backgroundVideo" ? SITE_VIDEO_MAX_BYTES : 8_000_000;
     if (data.value.length > limit) return socket.emit("errorMessage","That file is too large — try a smaller one.");
-    siteConfig = { ...siteConfig, [data.field]: data.value || undefined };
+    const norm = data.value ? normalizeImage(data.value) : undefined;
+    if (data.value && !norm) return socket.emit("errorMessage","Unsupported file — use an image, audio or video file.");
+    siteConfig = { ...siteConfig, [data.field]: norm };
     io.emit("siteConfig", siteConfig); // broadcast to everyone, everywhere, live
     await saveSiteConfigField(data.field); // permanent — survives restarts/redeploys
   });
@@ -352,11 +664,65 @@ io.on("connection", socket=>{
       if (!isApprovedEmail(email)) {
         return socket.emit("authResult", { ok: false, reason: "not_allowed", email });
       }
+      const token = await createSession(email, payload.name, payload.picture);
       socket.data.authedEmail = email;
-      socket.emit("authResult", { ok: true, email, name: payload.name, picture: payload.picture });
+      socket.data.sessionHash = hashToken(token);
+      socket.emit("authResult", { ok: true, email, name: payload.name, picture: payload.picture, sessionToken: token });
+      await afterAuth(socket, email);
     } catch {
       socket.emit("authResult", { ok: false, reason: "invalid_token" });
     }
+  });
+
+  // Quietly resume a saved login (page refresh / browser reopened / server woke up).
+  socket.on("resumeSession", async (data: { token: string }) => {
+    try {
+      await persistReady;
+      const tok = typeof data?.token === "string" ? data.token : "";
+      let h = tok ? hashToken(tok) : "";
+      if (h && !sessions[h] && !persistHealthy) { // storage was unreachable at boot — try once more before judging
+        await loadCritical(true).catch(() => false);
+      }
+      const sess = h ? sessions[h] : undefined;
+      if (!sess || sess.exp < Date.now()) {
+        if (!persistHealthy) return socket.emit("authResult", { ok: false, reason: "server_error" }); // keep the token, client retries
+        return socket.emit("authResult", { ok: false, reason: "session_expired" });
+      }
+      if (!isApprovedEmail(sess.email)) {
+        delete sessions[h]; void saveSessions();
+        return socket.emit("authResult", { ok: false, reason: "not_allowed", email: sess.email });
+      }
+      socket.data.authedEmail = sess.email;
+      socket.data.sessionHash = h;
+      if (sess.exp - Date.now() < SESSION_TTL_MS - 24 * 60 * 60 * 1000) { sess.exp = Date.now() + SESSION_TTL_MS; void saveSessions(); } // sliding renewal, at most daily
+      socket.emit("authResult", { ok: true, email: sess.email, name: sess.name, picture: sess.picture });
+      await afterAuth(socket, sess.email);
+    } catch (e) {
+      console.error("[auth] resume error", e);
+      socket.emit("authResult", { ok: false, reason: "server_error" });
+    }
+  });
+
+  // Logout: forget this device's session for good and step out of the room's live view
+  // (your seat is kept, so signing back in puts you right back).
+  socket.on("logout", async (data: { token?: string }) => {
+    const h = socket.data.sessionHash || (typeof data?.token === "string" && data.token ? hashToken(data.token) : "");
+    if (h && sessions[h]) { delete sessions[h]; await saveSessions(); }
+    const room = socket.data.room; const st = room ? rooms.get(room) : undefined;
+    if (st) {
+      const pl = st.players.find((x) => x.id === socket.id);
+      if (pl) pl.connected = false;
+      socket.leave(room); socket.data.room = undefined; emit(room);
+    }
+    socket.data.authedEmail = undefined; socket.data.sessionHash = undefined; socket.data.wantsLibrary = false;
+    socket.emit("loggedOut");
+  });
+
+  // Saved per-account settings (player name, room settings, limits).
+  socket.on("saveProfile", async (data: { settings: any }) => {
+    const email = socket.data.authedEmail as string | undefined;
+    if (!email || !persistHealthy) return;
+    await storePut(profileKey(email), JSON.stringify(sanitizeProfile(data?.settings)));
   });
 
   // --- Owner-managed approved-accounts list (needs the owner key, not Google auth) ---
@@ -368,6 +734,7 @@ io.on("connection", socket=>{
   socket.on("addAllowedEmail", async (data: { key: string; email: string }) => {
     await persistReady;
     if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage", "Incorrect owner key.");
+    if (!storageReady(socket)) return;
     const email = (data.email || "").trim().toLowerCase();
     if (!email || !email.includes("@")) return socket.emit("errorMessage", "Enter a valid email address.");
     if (!allowedEmails.includes(email)) { allowedEmails.push(email); await saveAllowedEmails(); }
@@ -376,8 +743,16 @@ io.on("connection", socket=>{
   socket.on("removeAllowedEmail", async (data: { key: string; email: string }) => {
     await persistReady;
     if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage", "Incorrect owner key.");
-    allowedEmails = allowedEmails.filter((e) => e !== (data.email || "").toLowerCase());
+    if (!storageReady(socket)) return;
+    const gone = (data.email || "").trim().toLowerCase();
+    if (gone === OWNER_EMAIL) return socket.emit("errorMessage", "The owner account can't be removed.");
+    allowedEmails = allowedEmails.filter((e) => e !== gone);
+    revokeSessionsFor(gone); // a removed account is signed out everywhere
+    for (const [, sk] of io.sockets.sockets) {
+      if (sk.data.authedEmail === gone) { sk.data.authedEmail = undefined; sk.emit("authResult", { ok: false, reason: "not_allowed", email: gone }); }
+    }
     await saveAllowedEmails();
+    await saveSessions();
     socket.emit("allowedEmailsList", allowedEmails);
   });
 
@@ -386,6 +761,7 @@ io.on("connection", socket=>{
     bidIncrement:number; timerMax:number; characters:Character[]; limits?:Partial<CharacterLimits>;
   })=>{
     if (!requireAuth(socket)) return;
+    if (!cfg || typeof cfg !== "object") return;
     const code=roomCode();
     const limits=sanitizeLimits(cfg.limits);
     const mode:GameMode = cfg.mode === "SOLO" ? "SOLO" : "TEAM";
@@ -417,8 +793,9 @@ io.on("connection", socket=>{
   });
 
   socket.on("joinRoom",(data:{roomCode:string;name:string;teamId?:string})=>{
-    const s=rooms.get(String(data.roomCode||"").toUpperCase());
     if (!requireAuth(socket)) return;
+    if (!data || typeof data !== "object") return;
+    const s=rooms.get(String(data.roomCode||"").toUpperCase());
     if(!s) return socket.emit("errorMessage","Room not found.");
     if(s.phase!=="LOBBY") return socket.emit("errorMessage","This auction has already started.");
 
@@ -490,6 +867,7 @@ io.on("connection", socket=>{
     const need = requiredCount(s.limits);
     if(s.characters.length < need) return socket.emit("errorMessage",`Select ${need} characters first (you have ${s.characters.length}/${need}).`);
     unsoldCountsByRoom.set(room, new Map());
+    originalCharacters.set(room, clone(s.characters)); // so "Play Again" gets the full list back, not just the last re-auction round
     s.phase="BIDDING"; s.round=1; s.unsoldQueue=[]; s.finalUnsold=[];
     s.currentIndex=0; s.currentBid=s.characters[0].basePrice; s.currentBidderTeamId=null; s.currentBidderPlayerId=null; s.currentBidderName=null; s.timer=s.timerMax;
     emit(room); startTimer(room);
@@ -560,17 +938,20 @@ io.on("connection", socket=>{
     emit(room);
   });
 
-  socket.on("updateBackground",(dataUrl:string)=>{
+  socket.on("updateBackground",async (dataUrl:string)=>{
     if (!requireAuth(socket)) return;
     const room=socket.data.room; const s=rooms.get(room);
     const p=s?.players.find(x=>x.id===socket.id);
     if(!s || !p?.isHost) return;
     if(typeof dataUrl !== "string") return;
     if(dataUrl.length > 6_000_000) return socket.emit("errorMessage","Background image is too large — try a smaller file.");
-    s.background = dataUrl || undefined;
-    roomBackgroundDefault = s.background; // new rooms start with the last background you set
-    if (s.background) void storePut("room-background.txt", s.background); else void storeDelete("room-background.txt");
+    const norm = dataUrl ? normalizeImage(dataUrl) : undefined;
+    if (dataUrl && !norm) return socket.emit("errorMessage","Unsupported file — use an image.");
+    s.background = norm;
+    roomBackgroundDefault = norm; // new rooms start with the last background you set
     emit(room);
+    await flushMedia();
+    if (norm) await storePut("room-background.txt", norm); else await storeDelete("room-background.txt");
   });
 
   // Owner-only: change one character's picture from the auction page itself, any
@@ -587,9 +968,12 @@ io.on("connection", socket=>{
     if(data.image.length > 6_000_000) return socket.emit("errorMessage","That image is too large — try a smaller one.");
     const char=s.characters.find(c=>c.id===data.characterId);
     if(!char) return socket.emit("errorMessage","Character not found.");
-    char.image = data.image || undefined;
+    const url = data.image ? normalizeImage(data.image) : undefined;
+    if (data.image && !url) return socket.emit("errorMessage","Unsupported file — use an image.");
+    char.image = url;
     emit(room);
-    await saveCharImage(char.id, char.image); // permanent — used by every future room too
+    await saveCharImage(char.id, url); // permanent — used by every future room too
+    sendLibraryToWatchers();
   });
 
   // --- Character library + host selection ---------------------------------------
@@ -625,6 +1009,7 @@ io.on("connection", socket=>{
   socket.on("saveDefaultSelection", async (data: { key: string; ids: string[] }) => {
     await persistReady;
     if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage","Incorrect owner key.");
+    if (!storageReady(socket)) return;
     if (!Array.isArray(data.ids)) return;
     const valid = new Set(fullLibrary().map(c=>c.id));
     defaultSelection = Array.from(new Set(data.ids.map(String))).filter(id=>valid.has(id));
@@ -636,6 +1021,7 @@ io.on("connection", socket=>{
   socket.on("libraryUpsert", async (data: { key: string; character: Partial<Character> }) => {
     await persistReady;
     if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage","Incorrect owner key.");
+    if (!storageReady(socket)) return;
     const raw = data.character || {};
     if (!String(raw.name||"").trim()) return socket.emit("errorMessage","Give the character a name.");
     if (typeof raw.image === "string" && raw.image.length > 6_000_000) return socket.emit("errorMessage","That image is too large — try a smaller one.");
@@ -643,7 +1029,7 @@ io.on("connection", socket=>{
     const clean = clampCharacter({ ...raw, id }, LIB_LIMITS, id);
     const idx = customLibrary.findIndex(c=>c.id===id);
     if (idx >= 0) customLibrary[idx] = clean; else customLibrary.push(clean);
-    if (raw.image !== undefined) await saveCharImage(id, raw.image || undefined);
+    if (raw.image !== undefined) await saveCharImage(id, clean.image);
     await saveLibrary();
     sendLibraryToWatchers();
     socket.emit("libraryAdded", { id });
@@ -651,6 +1037,7 @@ io.on("connection", socket=>{
   socket.on("libraryDelete", async (data: { key: string; id: string }) => {
     await persistReady;
     if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage","Incorrect owner key.");
+    if (!storageReady(socket)) return;
     const before = customLibrary.length;
     customLibrary = customLibrary.filter(c=>c.id!==data.id);
     if (customLibrary.length === before) return socket.emit("errorMessage","Only characters you added yourself can be deleted.");
@@ -669,6 +1056,8 @@ io.on("connection", socket=>{
     if(!s || !p?.isHost) return socket.emit("errorMessage","Only the host can start a new round.");
     stopTimer(room);
     unsoldCountsByRoom.set(room, new Map());
+    const orig = originalCharacters.get(room);
+    if (orig && orig.length) s.characters = clone(orig); // bring back the whole list, not only the last re-auction round
     s.phase="LOBBY"; s.round=1; s.unsoldQueue=[]; s.finalUnsold=[]; s.history=[];
     s.currentIndex=0; s.currentBid=0; s.currentBidderTeamId=null; s.currentBidderPlayerId=null; s.currentBidderName=null;
     s.timer=s.timerMax;
@@ -683,5 +1072,10 @@ io.on("connection", socket=>{
   });
 });
 
-app.get("/health",(_,res)=>res.json({ok:true,rooms:rooms.size}));
-httpServer.listen(3001,"0.0.0.0",()=>console.log("Auction server: http://0.0.0.0:3001"));
+app.get("/health",(_,res)=>res.json({ok:true,rooms:rooms.size,store:REMOTE_STORE?"supabase":"local-disk",storageHealthy:persistHealthy}));
+const PORT = Number(process.env.PORT) || 3001;
+if (OWNER_EMAIL === "you@gmail.com") console.warn("[auth] AUCTION_OWNER_EMAIL is not set — set it on Render to your own Gmail or you will be locked out.");
+// One bad event must never take the whole server (and every open room) down.
+process.on("unhandledRejection", (e) => console.error("[server] unhandled rejection", e));
+process.on("uncaughtException", (e) => console.error("[server] uncaught exception", e));
+httpServer.listen(PORT,"0.0.0.0",()=>console.log(`Auction server: http://0.0.0.0:${PORT}`));
