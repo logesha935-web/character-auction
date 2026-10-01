@@ -205,9 +205,23 @@ function playCustomOneShot(url: string, volume: number) {
 
 // Final-reveal card: the picture fills the whole card (full-bleed), and the details sit on a
 // gradient at the bottom. `index` staggers the entrance so the cards reveal one after another.
+// The animation starts when the card scrolls into view (not when the page loads). On a phone only
+// ~2 cards fit on screen, so cards further down used to finish animating before anyone saw them.
 function RevealCard({ c, price, index, team, color }: { c: Character; price: number; index: number; team?: string; color?: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [shown, setShown] = useState(false);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || shown) return;
+    if (typeof IntersectionObserver === "undefined") { setShown(true); return; }
+    const io = new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting)) { setShown(true); io.disconnect(); }
+    }, { threshold: 0.2 });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [shown]);
   return (
-    <div className="reveal-card" style={{ "--d": `${Math.min(index, 12) * 0.14}s`, "--tc": color || "var(--red-2)" } as CSSProperties}>
+    <div ref={ref} className={shown ? "reveal-card is-in" : "reveal-card"} style={{ "--d": `${(index % 4) * 0.12}s`, "--tc": color || "var(--red-2)" } as CSSProperties}>
       <div className="reveal-media">
         {c.image ? <img src={c.image} alt={c.name} /> : <div className="reveal-initial">{c.name[0]}</div>}
       </div>
