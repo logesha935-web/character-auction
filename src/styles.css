@@ -756,3 +756,24 @@ button svg{vertical-align:-3px; margin-right:6px;}
   100%{transform:scale(1); text-shadow:none;}
 }
 .team-roster{margin-top:4px;}
+
+/* ---- reveal card: winning team line ---- */
+.reveal-team{display:flex; align-items:center; gap:6px; font-size:11px; font-weight:700; letter-spacing:.6px; color:#fff; text-transform:uppercase;}
+.reveal-team i{width:8px; height:8px; border-radius:50%; background:var(--tc,var(--red-2)); box-shadow:0 0 8px var(--tc,var(--red-2)); flex:none;}
+
+/* ---- host room editor (lobby / play-again setup) ---- */
+.room-editor{display:flex; flex-direction:column; gap:12px; margin:14px 0;}
+.room-editor > label, .room-editor > .two{margin:0;}
+.mode-toggle.row{flex-direction:row;}
+.mode-toggle.row .mode-btn{flex:1; justify-content:center;}
+.ed-head{display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:6px;}
+.ed-head .primary{padding:8px 14px; font-size:13px;}
+.ed-team{gap:8px;}
+.ed-team-head{display:flex; align-items:center; gap:8px;}
+.ed-team-head .ed-input{flex:1; font-weight:700;}
+.ed-player{display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
+.ed-player .ed-input{flex:1 1 120px; min-width:0;}
+.ed-player select{flex:0 1 150px; min-width:0;}
+.ed-input{padding:8px 10px; font-size:13px;}
+.ed-tag{font-size:10px; font-weight:800; letter-spacing:1px; padding:2px 6px; border-radius:6px; background:rgba(230,32,47,.22); color:var(--red-2);}
+.ed-tag.off{background:rgba(255,255,255,.08); color:var(--muted);}

@@ -6,7 +6,7 @@ import {
   User, Image, CheckCircle2, XCircle, Layers, Settings, Volume2, VolumeX,
   RotateCcw, LogOut, Video, Library,
 } from "lucide-react";
-import { AuctionState, Character, CharacterLimits, GameMode, SiteConfig } from "./types";
+import { AuctionState, Character, CharacterLimits, GameMode, Player, SiteConfig } from "./types";
 import { demoCharacters, defaultLimits } from "./data";
 
 // Locally (or over LAN) this guesses the backend at the same host on port 3001,
@@ -206,9 +206,9 @@ function playCustomOneShot(url: string, volume: number) {
 
 // Final-reveal card: the picture fills the whole card (full-bleed), and the details sit on a
 // gradient at the bottom. `index` staggers the entrance so the cards reveal one after another.
-function RevealCard({ c, price, index }: { c: Character; price: number; index: number }) {
+function RevealCard({ c, price, index, team, color }: { c: Character; price: number; index: number; team?: string; color?: string }) {
   return (
-    <div className="reveal-card" style={{ "--d": `${Math.min(index, 12) * 0.14}s` } as CSSProperties}>
+    <div className="reveal-card" style={{ "--d": `${Math.min(index, 12) * 0.14}s`, "--tc": color || "var(--red-2)" } as CSSProperties}>
       <div className="reveal-media">
         {c.image ? <img src={c.image} alt={c.name} /> : <div className="reveal-initial">{c.name[0]}</div>}
       </div>
@@ -216,6 +216,7 @@ function RevealCard({ c, price, index }: { c: Character; price: number; index: n
       <div className="reveal-info">
         <span className="reveal-universe">{c.universe} • {c.rarity}</span>
         <span className="reveal-name">{c.name}</span>
+        {team && <span className="reveal-team"><i />Won by {team}</span>}
         {c.abilityNote && <span className="reveal-note">{c.abilityNote}</span>}
         <div className="reveal-stats">
           <span><span className="rs-label">Power</span><span className="rs-val">{c.power}</span></span>
@@ -233,6 +234,98 @@ function MiniIcon({ c, size = 26 }: { c: Character; size?: number }) {
     <span className="mini-icon" style={{ width: size, height: size }} title={c.name}>
       {c.image ? <img src={c.image} alt={c.name} /> : <span>{c.name[0]}</span>}
     </span>
+  );
+}
+
+// Host-only lobby editor: change teams, players, mode and round settings. Every button sends a
+// small event to the server, which updates the room and broadcasts it to all clients at once, so
+// the lobby always shows the server's real data (nothing is kept only on the host's screen).
+function RoomEditor({ state, socket }: { state: AuctionState; socket: Socket | null }) {
+  const serverBudget = state.teams[0]?.budget ?? 100000;
+  const [title, setTitle] = useState(state.title);
+  const [budget, setBudget] = useState(serverBudget);
+  const [inc, setInc] = useState(state.bidIncrement);
+  const [timer, setTimer] = useState(state.timerMax);
+  useEffect(() => { setTitle(state.title); setBudget(serverBudget); setInc(state.bidIncrement); setTimer(state.timerMax); },
+    [state.roomCode, state.title, serverBudget, state.bidIncrement, state.timerMax]);
+  const send = (ev: string, data?: unknown) => socket?.emit(ev, data);
+  const isTeam = state.mode === "TEAM";
+  const dirty = title !== state.title || budget !== serverBudget || inc !== state.bidIncrement || timer !== state.timerMax;
+  const playerOf = (id: string) => state.players.find((p) => p.id === id);
+
+  function switchMode(m: GameMode) {
+    if (m === state.mode) return;
+    if (state.players.length > 1 && !window.confirm(`Switch to ${m} mode? Players will be re-arranged ${m === "SOLO" ? "into their own wallets" : "into teams"}.`)) return;
+    send("updateSettings", { mode: m });
+  }
+  const nameInput = (initial: string, onSave: (v: string) => void) => (
+    <input className="ed-input" key={initial} defaultValue={initial} maxLength={30}
+      onBlur={(e) => { const v = e.target.value.trim(); if (v && v !== initial) onSave(v); else e.target.value = initial; }}
+      onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }} />
+  );
+  const playerRow = (pl: Player, teamOptions?: boolean, currentTeam?: string) => (
+    <div className="ed-player" key={pl.id}>
+      {nameInput(pl.name, (v) => send("renamePlayer", { playerId: pl.id, name: v }))}
+      {pl.isHost && <span className="ed-tag">HOST</span>}
+      {!pl.connected && <span className="ed-tag off">offline</span>}
+      {teamOptions && (
+        <select value={currentTeam} onChange={(e) => send("movePlayer", { playerId: pl.id, teamId: e.target.value })}>
+          {state.teams.map((t) => <option key={t.id} value={t.id}>{t.name} ({t.members.length}/5)</option>)}
+        </select>
+      )}
+      {!pl.isHost && <button className="icon danger" title="Remove player" onClick={() => send("removePlayer", { playerId: pl.id })}><Trash2 size={15} /></button>}
+    </div>
+  );
+
+  return (
+    <div className="room-editor">
+      <small>ROOM SETUP — EDITABLE</small>
+      <p className="muted small">Change anything here before starting. New players can still join with the room code.</p>
+
+      <label>Auction title<input value={title} onChange={(e) => setTitle(e.target.value)} /></label>
+      <div className="mode-toggle row">
+        <button type="button" className={isTeam ? "mode-btn active" : "mode-btn"} onClick={() => switchMode("TEAM")}><Users size={15} /> Team</button>
+        <button type="button" className={!isTeam ? "mode-btn active" : "mode-btn"} onClick={() => switchMode("SOLO")}><User size={15} /> Solo</button>
+      </div>
+      <div className="two">
+        <label>Budget<input type="number" value={budget} onChange={(e) => setBudget(+e.target.value)} /></label>
+        <label>Bid increment<input type="number" value={inc} onChange={(e) => setInc(+e.target.value)} /></label>
+      </div>
+      <label>Timer per character (seconds)
+        <select value={timer} onChange={(e) => setTimer(+e.target.value)}>
+          {[10, 15, 20, 30, 45, 60].map((n) => <option key={n}>{n}</option>)}
+        </select>
+      </label>
+      <button className="secondary full" disabled={!dirty} onClick={() => send("updateSettings", { title, budget, bidIncrement: inc, timerMax: timer })}>
+        <Check size={16} /> SAVE SETTINGS
+      </button>
+
+      <div className="ed-head">
+        <b>{isTeam ? `Teams (${state.teams.length}/12)` : `Players (${state.players.length}/12)`}</b>
+        {isTeam && <button className="primary" disabled={state.teams.length >= 12} onClick={() => send("addTeam", {})}><Plus size={15} /> ADD TEAM</button>}
+      </div>
+
+      {isTeam ? (
+        <div className="teams">
+          {state.teams.map((t) => (
+            <div className="team ed-team" key={t.id} style={{ borderLeft: `3px solid ${t.color}` }}>
+              <div className="ed-team-head">
+                {nameInput(t.name, (v) => send("renameTeam", { teamId: t.id, name: v }))}
+                <small>{t.members.length}/5</small>
+                <button className="icon danger" title="Remove team" disabled={state.teams.length <= 2} onClick={() => send("removeTeam", { teamId: t.id })}><Trash2 size={15} /></button>
+              </div>
+              {t.members.length === 0 && <span className="muted small">No players yet — they can join with the code, or move someone here.</span>}
+              {t.members.map((id) => { const pl = playerOf(id); return pl ? playerRow(pl, true, t.id) : null; })}
+              <small>{money(t.budget - t.spent)} left</small>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="teams">
+          {state.players.map((pl) => <div className="team ed-team" key={pl.id}>{playerRow(pl)}</div>)}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -278,6 +371,7 @@ export default function App() {
   const authed = authStatus === "in";
   const [slowRestore, setSlowRestore] = useState(false);
   const profileLoaded = useRef(false);
+  const exitedRef = useRef(false); // true after Exit Game, so a late "state" event can't drag you back into the room
   const [authEmail, setAuthEmail] = useState("");
   const [authName, setAuthName] = useState("");
   const [authError, setAuthError] = useState("");
@@ -392,12 +486,19 @@ export default function App() {
       if (p.limits && typeof p.limits === "object") setLimitsDraft((prev) => ({ ...prev, ...p.limits }));
     };
     s.on("profile", (p: any) => { applyProfile(p); profileLoaded.current = true; });
+    s.on("removedFromRoom", () => {
+      exitedRef.current = true;
+      setState(null); setRoom(""); setScreen("home");
+      setToast("The host removed you from the room."); setTimeout(() => setToast(""), 2800);
+    });
     s.on("resumedRoom", (d: { roomCode: string; phase: AuctionState["phase"] }) => {
+      exitedRef.current = false;
       setRoom(d.roomCode);
       setScreen(d.phase === "BIDDING" ? "auction" : d.phase === "COMPLETE" ? "results" : "lobby");
     });
     s.on("loggedOut", () => { /* local cleanup already done by logout() */ });
     s.on("state", (raw: AuctionState) => {
+      if (exitedRef.current) return;
       const x = resolveState(raw);
       setState(x);
       // Only move screens if the player is inside a room screen; if they chose to go
@@ -417,6 +518,7 @@ export default function App() {
         const cached = r.email ? lsGet(PROFILE_PREFIX + r.email) : null; // instant, before the server copy arrives
         if (cached) { try { applyProfile(JSON.parse(cached)); } catch { /* ignore */ } }
         setAuthStatus("in");
+        s.emit("getLibrary"); // pull the saved character library (with images) from the server on every login / app start
       } else if (r.reason === "server_error") {
         // Server/storage not ready yet — keep the saved login and try again shortly.
         setTimeout(() => { const t = lsGet(SESSION_KEY); if (t) s.emit("resumeSession", { token: t }); }, 4000);
@@ -601,6 +703,7 @@ export default function App() {
   }
 
   function create() {
+    exitedRef.current = false;
     const names = Array.from({ length: teamCount }, (_, i) => teamNames[i] || `Team ${i + 1}`);
     socket?.emit("createRoom", {
       name: name || "Host", title, mode, budget, bidIncrement: increment, timerMax: timer,
@@ -611,6 +714,7 @@ export default function App() {
   // Landing page: pick the mode first, then go to the lobby (whose setup form uses it).
   function startNew(m: GameMode) { setMode(m); setScreen("lobby"); }
   function join() {
+    exitedRef.current = false;
     socket?.emit("joinRoom", { roomCode: room.trim().toUpperCase(), name: name || "Player" });
     setScreen("lobby");
   }
@@ -656,9 +760,18 @@ export default function App() {
     setScreen("home"); setAuthEmail(""); setAuthName(""); setAuthError("");
     setAuthStatus("out");
   }
-  // Just steps back to the home screen, same as the browser Back button — the
-  // room and your seat in it are untouched, so "Return to auction" still works.
+  // Exit Game: really leave the room (server removes your seat and closes the room if nobody is
+  // left) and wipe everything that belonged to this game, then start again from the first screen.
+  // Saved characters, images, wallpapers and sounds live on the server and are NOT touched.
   function exitGame() {
+    if (!window.confirm("Exit this game? You will leave the room and go back to the home page.")) return;
+    exitedRef.current = true;
+    socket?.emit("leaveRoom");
+    setState(null); setRoom(""); setSelectedTeam("t1");
+    setPick([]);
+    setEditingId(null); setEditDraft(null); setLibEditId(null); setCharDraft(blankDraft(limitsDraft));
+    setFx(null); prevHistoryLen.current = 0; prevQueueLen.current = 0; prevTrashLen.current = 0;
+    setManagerTab("pick");
     setScreen("home");
   }
 
@@ -1058,15 +1171,19 @@ export default function App() {
                   </select>
                 </label>
               )}
-              <div className="teams">
-                {state.teams.map((t) => (
-                  <div className="team" key={t.id}>
-                    <b>{t.name}</b>
-                    <span>{t.members.map((id) => state.players.find((p) => p.id === id)?.name).filter(Boolean).join(" • ") || "Waiting..."}</span>
-                    <small>{money(t.budget - t.spent)} left</small>
-                  </div>
-                ))}
-              </div>
+              {me?.isHost ? (
+                <RoomEditor state={state} socket={socket} />
+              ) : (
+                <div className="teams">
+                  {state.teams.map((t) => (
+                    <div className="team" key={t.id}>
+                      <b>{t.name}</b>
+                      <span>{t.members.map((id) => state.players.find((p) => p.id === id)?.name).filter(Boolean).join(" • ") || "Waiting..."}</span>
+                      <small>{money(t.budget - t.spent)} left</small>
+                    </div>
+                  ))}
+                </div>
+              )}
               {me?.isHost && (
                 <>
                   <button className="secondary full" onClick={shuffle}><Shuffle /> SHUFFLE CHARACTERS</button>
@@ -1153,7 +1270,7 @@ export default function App() {
               {charDraft.image && <img className="preview" src={charDraft.image} alt="preview" />}
               <div className="two">
                 <label>Character name<input value={charDraft.name} onChange={(e) => setCharDraft({ ...charDraft, name: e.target.value })} placeholder="e.g. Loki" /></label>
-                <label>Universe / category<input value={charDraft.universe} onChange={(e) => setCharDraft({ ...charDraft, universe: e.target.value })} placeholder="e.g. Marvel" /></label>
+                <label>Movie / universe<input value={charDraft.universe} onChange={(e) => setCharDraft({ ...charDraft, universe: e.target.value })} placeholder="e.g. Marvel" /></label>
               </div>
               <label>Ability / power key note
                 <textarea rows={2} value={charDraft.abilityNote} onChange={(e) => setCharDraft({ ...charDraft, abilityNote: e.target.value })} placeholder="Short note on their power / ability, shown during bidding" />
@@ -1241,7 +1358,7 @@ export default function App() {
                       </label>
                       <div className="two">
                         <label>Name<input value={editDraft.name} onChange={(e) => setEditDraft({ ...editDraft, name: e.target.value })} /></label>
-                        <label>Universe<input value={editDraft.universe} onChange={(e) => setEditDraft({ ...editDraft, universe: e.target.value })} /></label>
+                        <label>Movie / universe<input value={editDraft.universe} onChange={(e) => setEditDraft({ ...editDraft, universe: e.target.value })} /></label>
                       </div>
                       <label>Ability / power key note<textarea rows={2} value={editDraft.abilityNote} onChange={(e) => setEditDraft({ ...editDraft, abilityNote: e.target.value })} /></label>
                       <div className="two">
@@ -1480,7 +1597,7 @@ export default function App() {
                   <div className="won-grid">
                     {won.length === 0 && <span className="muted small">Nothing won.</span>}
                     {won.map((h, i) => (
-                      <RevealCard key={i} c={h.character} price={h.amount} index={i} />
+                      <RevealCard key={i} c={h.character} price={h.amount} index={i} team={state.mode === "SOLO" ? pl!.name : t.name} color={t.color} />
                     ))}
                   </div>
                 </div>

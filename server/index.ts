@@ -27,6 +27,7 @@ const originalCharacters = new Map<string, Character[]>();
 const ROOM_IDLE_MS = 12 * 60 * 60 * 1000;
 const MAX_ROUNDS = 5;
 const MAX_SOLO_PLAYERS = 12;
+const MAX_TEAMS = 12;
 
 // --------------------------------------------------------------------------------
 // Site-wide (owner-only) landing page background + auction page sounds. Persists
@@ -589,6 +590,16 @@ function concludeCurrent(room:string, sold:boolean){
   if(awarded) void persistRooms(); // save the sale right away so a restart can't lose it
 }
 
+// Remove one player from a room; in SOLO mode their personal wallet goes with them.
+function dropPlayer(s:AuctionState, playerId:string){
+  const pl=s.players.find(x=>x.id===playerId); if(!pl) return;
+  s.players=s.players.filter(x=>x.id!==playerId);
+  for(const t of s.teams) t.members=t.members.filter(id=>id!==playerId);
+  if(s.mode==="SOLO") s.teams=s.teams.filter(t=>t.members.length>0 || t.roster.length>0 || t.id==="t1");
+  const seen=emailsByRoom.get(s.roomCode);
+  if(seen) for(const [em,id] of seen) if(id===playerId) seen.delete(em);
+}
+
 function advanceAuction(room:string){
   const s=rooms.get(room); if(!s) return;
   s.currentIndex++;
@@ -889,6 +900,126 @@ io.on("connection", socket=>{
     emit(s.roomCode);
   });
 
+  // ---------------------------------------------------------------------------
+  // Host-only lobby editing: teams, players, mode and round settings. All of these only work
+  // in the LOBBY (so after "Play Again" the host can reshape everything), and every change is
+  // broadcast to all clients straight away through emit().
+  // ---------------------------------------------------------------------------
+  function hostLobby(): AuctionState | null {
+    if (!requireAuth(socket)) return null;
+    const s=rooms.get(socket.data.room);
+    const p=s?.players.find(x=>x.id===socket.id);
+    if(!s || !p?.isHost){ socket.emit("errorMessage","Only the host can change this."); return null; }
+    if(s.phase!=="LOBBY"){ socket.emit("errorMessage","This can only be changed in the lobby, before the auction starts."); return null; }
+    return s;
+  }
+  const newTeamId=(s:AuctionState)=>{ let n=s.teams.length+1; while(s.teams.some(t=>t.id===`t${n}`)) n++; return `t${n}`; };
+  const cleanName=(v:any,fallback:string)=>String(v??"").trim().slice(0,30) || fallback;
+
+  socket.on("addTeam",(data:{name?:string})=>{
+    const s=hostLobby(); if(!s) return;
+    if(s.mode!=="TEAM") return socket.emit("errorMessage","Teams only exist in TEAM mode. In SOLO every player is their own team.");
+    if(s.teams.length>=MAX_TEAMS) return socket.emit("errorMessage",`A room can have at most ${MAX_TEAMS} teams.`);
+    const budget=s.teams[0]?.budget || 100000;
+    s.teams.push({ id:newTeamId(s), name:cleanName(data?.name,`Team ${s.teams.length+1}`), members:[], budget, spent:0, roster:[], color:colors[s.teams.length%colors.length] });
+    emit(s.roomCode);
+  });
+  socket.on("renameTeam",(data:{teamId:string; name:string})=>{
+    const s=hostLobby(); if(!s) return;
+    const t=s.teams.find(x=>x.id===data?.teamId); if(!t) return;
+    t.name=cleanName(data.name,t.name);
+    emit(s.roomCode);
+  });
+  socket.on("removeTeam",(data:{teamId:string})=>{
+    const s=hostLobby(); if(!s) return;
+    if(s.mode!=="TEAM") return;
+    if(s.teams.length<=2) return socket.emit("errorMessage","TEAM mode needs at least 2 teams.");
+    const t=s.teams.find(x=>x.id===data?.teamId); if(!t) return;
+    // Its players move to the emptiest remaining teams (max 5 per team) instead of being lost.
+    const others=s.teams.filter(x=>x.id!==t.id);
+    if(others.reduce((n,x)=>n+(5-x.members.length),0) < t.members.length) return socket.emit("errorMessage","Not enough room on the other teams for these players.");
+    for(const id of t.members){
+      const dest=[...others].sort((a,b)=>a.members.length-b.members.length)[0];
+      dest.members.push(id);
+      const pl=s.players.find(x=>x.id===id); if(pl) pl.teamId=dest.id;
+    }
+    s.teams=others;
+    emit(s.roomCode);
+  });
+  socket.on("movePlayer",(data:{playerId:string; teamId:string})=>{
+    const s=hostLobby(); if(!s) return;
+    if(s.mode!=="TEAM") return;
+    const pl=s.players.find(x=>x.id===data?.playerId);
+    const to=s.teams.find(x=>x.id===data?.teamId);
+    if(!pl || !to || pl.teamId===to.id) return;
+    if(to.members.length>=5) return socket.emit("errorMessage","That team is full (max 5).");
+    const from=s.teams.find(x=>x.id===pl.teamId);
+    if(from) from.members=from.members.filter(id=>id!==pl.id);
+    to.members.push(pl.id); pl.teamId=to.id;
+    emit(s.roomCode);
+  });
+  socket.on("renamePlayer",(data:{playerId:string; name:string})=>{
+    const s=hostLobby(); if(!s) return;
+    const pl=s.players.find(x=>x.id===data?.playerId); if(!pl) return;
+    pl.name=cleanName(data.name,pl.name);
+    if(s.mode==="SOLO"){ const t=s.teams.find(x=>x.id===pl.teamId); if(t) t.name=pl.name; } // SOLO: the "team" is the player
+    emit(s.roomCode);
+  });
+  socket.on("removePlayer",(data:{playerId:string})=>{
+    const s=hostLobby(); if(!s) return;
+    const pl=s.players.find(x=>x.id===data?.playerId);
+    if(!pl) return;
+    if(pl.isHost) return socket.emit("errorMessage","The host can't be removed — use Exit Game instead.");
+    dropPlayer(s, pl.id);
+    const sock=io.sockets.sockets.get(pl.id);
+    if(sock){ sock.leave(s.roomCode); sock.data.room=undefined; sock.emit("removedFromRoom"); }
+    emit(s.roomCode);
+  });
+
+  // Room-wide settings the host can change between rounds (budget, increment, timer, title, mode).
+  socket.on("updateSettings",(data:{title?:string; budget?:number; bidIncrement?:number; timerMax?:number; mode?:GameMode})=>{
+    const s=hostLobby(); if(!s || !data || typeof data!=="object") return;
+    if(typeof data.title==="string") s.title=cleanName(data.title,s.title);
+    if(Number.isFinite(data.budget)){ const b=Math.max(1000,Math.floor(data.budget as number)); for(const t of s.teams){ t.budget=b; t.spent=0; } }
+    if(Number.isFinite(data.bidIncrement)) s.bidIncrement=Math.max(1,Math.floor(data.bidIncrement as number));
+    if(Number.isFinite(data.timerMax)){ s.timerMax=Math.max(5,Math.floor(data.timerMax as number)); s.timer=s.timerMax; }
+    if(data.mode && data.mode!==s.mode){
+      const budget=s.teams[0]?.budget || 100000;
+      if(data.mode==="SOLO"){
+        if(s.players.length>MAX_SOLO_PLAYERS) return socket.emit("errorMessage",`SOLO mode supports up to ${MAX_SOLO_PLAYERS} players.`);
+        // every player becomes their own "team" (wallet)
+        s.teams=s.players.map((pl,i)=>{ pl.teamId=`t${i+1}`; return { id:`t${i+1}`, name:pl.name, members:[pl.id], budget, spent:0, roster:[], color:colors[i%colors.length] } as Team; });
+      } else {
+        const count=Math.max(2,Math.ceil(s.players.length/5));
+        s.teams=Array.from({length:count},(_,i)=>({ id:`t${i+1}`, name:`Team ${i+1}`, members:[] as string[], budget, spent:0, roster:[] as Character[], color:colors[i%colors.length] } as Team));
+        s.players.forEach((pl,i)=>{ const t=s.teams[i%count]; t.members.push(pl.id); pl.teamId=t.id; });
+      }
+      s.mode=data.mode;
+    }
+    emit(s.roomCode);
+  });
+
+  // Exit Game: really leave. The seat is removed, nothing pulls the person back in on refresh/login,
+  // and if nobody is left the room (timers, bids, everything) is deleted.
+  socket.on("leaveRoom",()=>{
+    const code=socket.data.room; const s=code?rooms.get(code):undefined;
+    socket.data.room=undefined;
+    if(code) socket.leave(code);
+    if(!s){ socket.emit("leftRoom"); return; }
+    dropPlayer(s, socket.id);
+    const email=String(socket.data.authedEmail||"").toLowerCase();
+    if(email) emailsByRoom.get(code)?.delete(email);
+    if(!s.players.some(p=>p.connected)){
+      // nobody is connected any more — shut the room down completely
+      stopTimer(code); rooms.delete(code); emailsByRoom.delete(code); unsoldCountsByRoom.delete(code);
+      originalCharacters.delete(code); roomActivity.delete(code); void persistRooms();
+    } else {
+      if(!s.players.some(p=>p.isHost)){ const next=s.players.find(p=>p.connected)||s.players[0]; if(next) next.isHost=true; } // host left: pass the role on
+      emit(code);
+    }
+    socket.emit("leftRoom");
+  });
+
   socket.on("startAuction",()=>{
     if (!requireAuth(socket)) return;
     const room=socket.data.room; const s=rooms.get(room);
@@ -1098,6 +1229,7 @@ io.on("connection", socket=>{
     s.timer=s.timerMax;
     for(const t of s.teams){ t.spent=0; t.roster=[]; }
     emit(room);
+    void persistRooms();
   });
 
   socket.on("disconnect",()=>{
