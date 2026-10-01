@@ -1082,8 +1082,18 @@ export default function App() {
   if (screen === "lobby") return (
     <main className="page" style={liveWallpaper ? undefined : bgStyle}>
       {liveWallpaper}
-      <header className="top"><b>◆ CHARACTER AUCTION</b><span>{state?.roomCode || "NEW ROOM"}</span></header>
-      <div className="grid">
+      <header className="top">
+        <b>◆ CHARACTER AUCTION</b>
+        <div>
+          <span>{state?.roomCode || "NEW ROOM"}</span>
+          {state && (
+            <button className="exit-btn" title="Leave this room and go to the home page" onClick={exitGame}>
+              <LogOut size={14} /> EXIT GAME
+            </button>
+          )}
+        </div>
+      </header>
+      <div className={state ? "grid has-room" : "grid"}>
         <section className="panel">
           <small>HOST / PLAYER</small><h2>Game setup</h2>
           <label>Your name<input value={name} onChange={(e) => setName(e.target.value)} placeholder="Loki" /></label>
@@ -1411,9 +1421,6 @@ export default function App() {
           {" • "}ROOM {state.roomCode} • <strong>{state.timer}s</strong>
           <button className="mute-btn" title={muted ? "Unmute sound" : "Mute sound"} onClick={() => setMuted((m) => !m)}>
             {muted ? <VolumeX size={15} /> : <Volume2 size={15} />}
-          </button>
-          <button className="exit-btn" title="Leave this auction and go to the home page" onClick={exitGame}>
-            <LogOut size={14} /> EXIT GAME
           </button>
         </div>
       </header>

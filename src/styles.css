@@ -778,10 +778,70 @@ button svg{vertical-align:-3px; margin-right:6px;}
 .ed-tag{font-size:10px; font-weight:800; letter-spacing:1px; padding:2px 6px; border-radius:6px; background:rgba(230,32,47,.22); color:var(--red-2);}
 .ed-tag.off{background:rgba(255,255,255,.08); color:var(--muted);}
 
-/* ---- Exit Game button on the auction page (kept small and in the header, away from the bid buttons) ---- */
+/* ---- Exit Game button in the room (lobby) header ---- */
 .exit-btn{
   margin-left:12px; display:inline-flex; align-items:center; gap:6px; vertical-align:middle;
   padding:6px 12px; font-size:11px; font-weight:700; letter-spacing:1px;
   background:transparent; color:var(--muted); border:1px solid var(--border-strong); border-radius:var(--radius-sm,8px); cursor:pointer;
 }
 .exit-btn:hover{color:#fff; border-color:var(--red); background:rgba(230,32,47,.12);}
+
+/* =====================================================================================
+   MOBILE LAYOUT (phones). Layout only — same colours. The character-image / poster /
+   pick-card / upload / reveal-card styles are deliberately NOT touched here.
+   ===================================================================================== */
+@media (max-width:640px){
+  /* ---- top bars: one tidy row ---- */
+  .nav{flex-wrap:nowrap; gap:8px; padding:12px 14px;}
+  .nav > span:not(.signed-in-as){display:none;}
+  .nav b{margin-right:auto; font-size:12px; letter-spacing:.4px; white-space:nowrap;}
+  .signed-in-as{max-width:64px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px; letter-spacing:.3px; margin-right:0 !important;}
+  .logout-btn{padding:7px 10px; font-size:12px; white-space:nowrap;}
+  .site-settings-trigger{flex:none;}
+  .top{gap:6px 10px; padding:10px 14px;}
+  .top b{flex:1 1 auto; min-width:0; font-size:12.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+  .top div{display:flex; align-items:center; flex-wrap:wrap; justify-content:flex-end; font-size:11px; letter-spacing:.5px; gap:4px 6px; flex:none;}
+  .exit-btn{margin-left:4px; padding:7px 10px; font-size:10.5px; letter-spacing:.6px; white-space:nowrap;}
+  .mute-btn{margin-left:4px;}
+  .top button, .nav button{min-height:36px;}
+
+  /* ---- landing ---- */
+  .hero-modes{flex-direction:column; align-items:stretch; width:100%;}
+  .hero-modes button, .hero .primary, .hero .secondary{width:100%; justify-content:center;}
+
+  /* ---- panels / forms ---- */
+  .grid{padding:14px 12px 0; gap:14px;}
+  .panel{padding:18px 15px;}
+  .panel h2{font-size:22px;}
+  .two{gap:10px;}
+  /* 16px stops iPhones zooming the page when a field is tapped */
+  input, select, textarea{font-size:16px; padding:12px 13px;}
+  button{min-height:44px;}
+  .icon{min-width:40px; min-height:40px;}
+  .code{font-size:clamp(32px,12vw,46px); letter-spacing:.14em;}
+
+  /* once a room exists, show the room first and the create/join form below it */
+  .grid.has-room > section:first-child{order:2;}
+  .grid.has-room > section:last-child{order:1;}
+
+  /* character-manager tabs: wrap instead of pushing the page sideways */
+  .manager-head{align-items:stretch;}
+  .tabbar{width:100%; flex-wrap:wrap; border-radius:18px; gap:4px;}
+  .tab{flex:1 1 30%; justify-content:center; padding:10px 8px; font-size:12px;}
+
+  /* room editor rows */
+  .ed-team-head{flex-wrap:wrap;}
+  .ed-player{flex-wrap:wrap;}
+  .ed-player select{flex:1 1 100%;}
+
+  /* ---- live auction: the character + BID buttons come first, teams/lists below ---- */
+  .auction{padding-left:12px; padding-right:12px; gap:14px;}
+  .auction > section{order:-1; min-width:0;}
+  .auction > aside .muted + small{display:block; margin-top:14px;}
+  .info h1{font-size:clamp(30px,10vw,44px); word-break:break-word;}
+  .grid .panel > p.muted + label{margin-top:12px;}
+
+  /* ---- results buttons ---- */
+  .results-actions{flex-direction:column; align-items:stretch;}
+  .results-actions button{width:100%; justify-content:center;}
+}
