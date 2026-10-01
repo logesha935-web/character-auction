@@ -686,16 +686,8 @@ button svg{vertical-align:-3px; margin-right:6px;}
   .rs-label{font-size:8px; letter-spacing:.8px;}
   .rs-val{font-size:13px; letter-spacing:.2px;}
 }
-/* Phones with "remove animations" / reduced motion turned on get a gentle fade instead of nothing. */
-@keyframes revealFade{ from{opacity:0;} to{opacity:1;} }
-@media (prefers-reduced-motion:reduce){
-  .reveal-card{transform:none;}
-  .reveal-card.is-in{animation:revealFade .7s ease var(--d) forwards;}
-  .reveal-media img{transform:none; filter:none; animation:none !important;}
-  .reveal-card.is-in .reveal-info{opacity:1; transform:none; animation:none;}
-  .reveal-info{opacity:1; transform:none;}
-  .reveal-shine{display:none;}
-}
+/* The reveal plays the SAME full animation (zoom, blur-to-sharp, shine sweep, details fade-in, red glow)
+   on PC and on every phone — it deliberately ignores the phone's "remove animations" setting. */
 
 /* --- legendary red-glow reveal, card-game style, for won characters --- */
 .legendary-glow{
