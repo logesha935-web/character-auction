@@ -777,3 +777,11 @@ button svg{vertical-align:-3px; margin-right:6px;}
 .ed-input{padding:8px 10px; font-size:13px;}
 .ed-tag{font-size:10px; font-weight:800; letter-spacing:1px; padding:2px 6px; border-radius:6px; background:rgba(230,32,47,.22); color:var(--red-2);}
 .ed-tag.off{background:rgba(255,255,255,.08); color:var(--muted);}
+
+/* ---- Exit Game button on the auction page (kept small and in the header, away from the bid buttons) ---- */
+.exit-btn{
+  margin-left:12px; display:inline-flex; align-items:center; gap:6px; vertical-align:middle;
+  padding:6px 12px; font-size:11px; font-weight:700; letter-spacing:1px;
+  background:transparent; color:var(--muted); border:1px solid var(--border-strong); border-radius:var(--radius-sm,8px); cursor:pointer;
+}
+.exit-btn:hover{color:#fff; border-color:var(--red); background:rgba(230,32,47,.12);}

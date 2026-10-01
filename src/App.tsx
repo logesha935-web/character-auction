@@ -27,7 +27,6 @@ const RARITIES = ["Common", "Rare", "Epic", "Legendary", "Custom"];
 // Browser-side persistence helpers (all wrapped: private mode / blocked storage must
 // never crash the app).
 const SESSION_KEY = "auction.session.v1";     // long-lived login token, cleared only on Logout
-const OWNERKEY_KEY = "auction.ownerKey.v1";   // owner key remembered on THIS device, cleared on Logout
 const PROFILE_PREFIX = "auction.profile.v1."; // per-account settings cache (server copy is authoritative)
 const lsGet = (k: string): string | null => { try { return window.localStorage.getItem(k); } catch { return null; } };
 const lsSet = (k: string, v: string) => { try { window.localStorage.setItem(k, v); } catch { /* ignore */ } };
@@ -361,7 +360,7 @@ export default function App() {
   // room's background, persists on the server until the owner changes it again.
   const [siteConfig, setSiteConfigState] = useState<SiteConfig>({});
   const [showSiteSettings, setShowSiteSettings] = useState(false);
-  const [ownerKey, setOwnerKey] = useState(() => lsGet(OWNERKEY_KEY) || "");
+  const [isOwner, setIsOwner] = useState(false); // set by the server after Google sign-in: true only for the owner account
   const [allowedEmailsList, setAllowedEmailsListState] = useState<string[]>([]);
   const [newEmailInput, setNewEmailInput] = useState("");
 
@@ -511,10 +510,10 @@ export default function App() {
     });
     s.on("siteConfig", (cfg: SiteConfig) => setSiteConfigState(resolveSite(cfg)));
     s.on("library", (d: { characters: Character[]; selection: string[] | null }) => { setLibrary((d.characters || []).map(resolveChar)); setDefaultSel(d.selection || null); });
-    s.on("authResult", (r: { ok: boolean; email?: string; name?: string; reason?: string; sessionToken?: string }) => {
+    s.on("authResult", (r: { ok: boolean; email?: string; name?: string; reason?: string; sessionToken?: string; isOwner?: boolean }) => {
       if (r.ok) {
         if (r.sessionToken) lsSet(SESSION_KEY, r.sessionToken); // first Google sign-in on this device: remember it
-        setAuthEmail(r.email || ""); setAuthName(r.name || ""); setAuthError("");
+        setAuthEmail(r.email || ""); setAuthName(r.name || ""); setAuthError(""); setIsOwner(!!r.isOwner);
         const cached = r.email ? lsGet(PROFILE_PREFIX + r.email) : null; // instant, before the server copy arrives
         if (cached) { try { applyProfile(JSON.parse(cached)); } catch { /* ignore */ } }
         setAuthStatus("in");
@@ -523,6 +522,7 @@ export default function App() {
         // Server/storage not ready yet — keep the saved login and try again shortly.
         setTimeout(() => { const t = lsGet(SESSION_KEY); if (t) s.emit("resumeSession", { token: t }); }, 4000);
       } else {
+        setIsOwner(false);
         if (r.reason === "session_expired" || r.reason === "not_allowed") lsDel(SESSION_KEY);
         setAuthStatus("out");
         setAuthError(
@@ -588,9 +588,6 @@ export default function App() {
     const t = setTimeout(() => setSlowRestore(true), 8000);
     return () => clearTimeout(t);
   }, [authStatus]);
-
-  // Remember the owner key on this device (cleared on Logout).
-  useEffect(() => { if (ownerKey) lsSet(OWNERKEY_KEY, ownerKey); else lsDel(OWNERKEY_KEY); }, [ownerKey]);
 
   // Save this account's settings (name, room settings, limits) — on the server (follows the
   // Google account) and in this browser as an instant cache.
@@ -728,18 +725,17 @@ export default function App() {
     socket?.emit("updateBackground", dataUrl);
   }
   async function saveSiteConfigField(field: keyof SiteConfig, file: File | null) {
-    if (!ownerKey.trim()) return flash("Enter the owner key first.");
+    if (!isOwner) return;
     const dataUrl = file ? await fileToDataUrl(file) : "";
-    socket?.emit("setSiteConfig", { key: ownerKey.trim(), field, value: dataUrl });
+    socket?.emit("setSiteConfig", { field, value: dataUrl });
   }
 
   // Owner-only, works right from the auction page: swaps one character's picture.
-  // Needs the same owner key as Site Settings — not just "host" — and it sticks
+  // Owner account only — not just "host" — and it sticks
   // on that character until the owner changes it again.
   async function changeCurrentCharacterImage(characterId: string, file: File | null) {
-    if (!ownerKey.trim()) return flash("Enter the owner key (Site Settings) to change character images.");
     const dataUrl = file ? await fileToDataUrl(file) : "";
-    socket?.emit("setCharacterImage", { key: ownerKey.trim(), characterId, image: dataUrl });
+    socket?.emit("setCharacterImage", { characterId, image: dataUrl });
   }
 
   // Host-only: send everyone in the room back to the lobby with a clean slate —
@@ -752,11 +748,11 @@ export default function App() {
   function logout() {
     if (!window.confirm("Log out on this device?")) return;
     socket?.emit("logout", { token: lsGet(SESSION_KEY) });
-    lsDel(SESSION_KEY); lsDel(OWNERKEY_KEY);
+    lsDel(SESSION_KEY);
     try { (window as any).google?.accounts?.id?.disableAutoSelect(); } catch { /* ignore */ }
     (window as any).__auctionGoogleCred = undefined;
     profileLoaded.current = false;
-    setOwnerKey(""); setLibrary([]); setState(null); setRoom(""); setShowSiteSettings(false);
+    setIsOwner(false); setLibrary([]); setState(null); setRoom(""); setShowSiteSettings(false);
     setScreen("home"); setAuthEmail(""); setAuthName(""); setAuthError("");
     setAuthStatus("out");
   }
@@ -776,18 +772,18 @@ export default function App() {
   }
 
   function loadAllowedEmails() {
-    if (!ownerKey.trim()) return flash("Enter the owner key first.");
-    socket?.emit("listAllowedEmails", { key: ownerKey.trim() });
+    if (!isOwner) return;
+    socket?.emit("listAllowedEmails", {});
   }
   function addAllowedEmail() {
-    if (!ownerKey.trim()) return flash("Enter the owner key first.");
+    if (!isOwner) return;
     if (!newEmailInput.trim()) return flash("Enter an email to add.");
-    socket?.emit("addAllowedEmail", { key: ownerKey.trim(), email: newEmailInput.trim() });
+    socket?.emit("addAllowedEmail", { email: newEmailInput.trim() });
     setNewEmailInput("");
   }
   function removeAllowedEmail(email: string) {
-    if (!ownerKey.trim()) return flash("Enter the owner key first.");
-    socket?.emit("removeAllowedEmail", { key: ownerKey.trim(), email });
+    if (!isOwner) return;
+    socket?.emit("removeAllowedEmail", { email });
   }
 
   const soundSlots: { field: keyof SiteConfig; label: string; hint: string }[] = [
@@ -874,20 +870,17 @@ export default function App() {
   }
   function saveDefaultPick() {
     if (!state) return;
-    if (!ownerKey.trim()) return flash("Enter the owner key (Site Settings) to save for all rooms.");
     socket?.emit("selectCharacters", { ids: pick });
-    socket?.emit("saveDefaultSelection", { key: ownerKey.trim(), ids: pick });
+    socket?.emit("saveDefaultSelection", { ids: pick });
     flash("Saved — new rooms will start with this list.");
   }
   async function saveToLibrary(imageFile: File | null) {
     if (!state) return;
-    if (!ownerKey.trim()) return flash("Enter the owner key (Site Settings) to save characters permanently.");
     if (!charDraft.name.trim()) return flash("Give the character a name.");
     const image = imageFile ? await fileToDataUrl(imageFile) : charDraft.image;
     const power = Math.min(state.limits.maxPower, Math.max(1, charDraft.power));
     const basePrice = Math.min(state.limits.maxValue, Math.max(state.limits.minValue, charDraft.basePrice));
     socket?.emit("libraryUpsert", {
-      key: ownerKey.trim(),
       character: {
         id: libEditId || undefined, name: charDraft.name.trim(), universe: charDraft.universe.trim() || "Custom",
         basePrice, power, popularity: power, rarity: charDraft.rarity, abilityNote: charDraft.abilityNote.trim(), image: cleanImg(image),
@@ -904,9 +897,8 @@ export default function App() {
     setManagerTab("add");
   }
   function deleteLibraryCharacter(c: Character) {
-    if (!ownerKey.trim()) return flash("Enter the owner key (Site Settings) to delete from the library.");
     if (!window.confirm(`Delete ${c.name} from the permanent library?`)) return;
-    socket?.emit("libraryDelete", { key: ownerKey.trim(), id: c.id });
+    socket?.emit("libraryDelete", { id: c.id });
     setPick((p) => p.filter((x) => x !== c.id));
   }
 
@@ -977,19 +969,20 @@ export default function App() {
         <b>◆ CHARACTER AUCTION</b>
         <span>TEAM MULTIPLAYER</span>
         <span className="signed-in-as" title={authEmail}>{authName || authEmail}</span>
-        <button className="site-settings-trigger" title="Site owner settings" onClick={() => setShowSiteSettings((v) => !v)}>
-          <Settings size={16} />
-        </button>
+        {isOwner && (
+          <button className="site-settings-trigger" title="Site owner settings" onClick={() => setShowSiteSettings((v) => !v)}>
+            <Settings size={16} />
+          </button>
+        )}
         <button className="logout-btn" title="Log out" onClick={logout}><LogOut size={14} /> Logout</button>
       </div>
-      {showSiteSettings && (
+      {isOwner && showSiteSettings && (
         <div className="site-settings-panel">
           <div className="site-settings-head">
             <small>OWNER ONLY — SITE CUSTOMIZATION</small>
             <button className="icon" onClick={() => setShowSiteSettings(false)}><X size={16} /></button>
           </div>
-          <p className="muted small">Everything below is set once by you and stays exactly as you leave it — for everyone, in every room — until you change it again. Protected by your owner key.</p>
-          <label>Owner key<input type="password" value={ownerKey} onChange={(e) => setOwnerKey(e.target.value)} placeholder="Enter your owner key" /></label>
+          <p className="muted small">Everything below is set once by you and stays exactly as you leave it — for everyone, in every room — until you change it again. Visible and usable only by the owner Google account.</p>
 
           <div className="site-settings-section">
             <small>LANDING PAGE BACKGROUND</small>
@@ -1226,7 +1219,7 @@ export default function App() {
                 <button className="ghost" onClick={() => setPick(pickable.slice(0, state.limits.maxCharacters).map((c) => c.id))}>Select first {Math.min(state.limits.maxCharacters, pickable.length)}</button>
                 <button className="ghost" onClick={() => setPick([])}>Clear</button>
                 <button className="secondary" onClick={applyPick} disabled={!pickDirty}><Check size={16} /> APPLY TO THIS AUCTION</button>
-                <button className="primary" onClick={saveDefaultPick}><Check size={16} /> SAVE FOR ALL ROOMS</button>
+                {isOwner && <button className="primary" onClick={saveDefaultPick}><Check size={16} /> SAVE FOR ALL ROOMS</button>}
               </div>
               {pickDirty && <p className="warn"><ShieldAlert size={14} /> You changed the ticks — press Apply (or Save for all rooms) or they won't count.</p>}
               {defaultSel && <p className="muted small">Saved default list: {defaultSel.length} characters.</p>}
@@ -1243,7 +1236,7 @@ export default function App() {
                         <div className="stat-row"><span>Power {c.power}</span><span>{money(c.basePrice)}</span></div>
                         {!library.some((l) => l.id === c.id) && <span className="tag-room">this room only</span>}
                       </div>
-                      {customIds.has(c.id) && (
+                      {isOwner && customIds.has(c.id) && (
                         <div className="char-actions" onClick={(e) => e.stopPropagation()}>
                           <button className="icon" onClick={() => editLibraryCharacter(c)}><Pencil size={16} /></button>
                           <button className="icon danger" onClick={() => deleteLibraryCharacter(c)}><Trash2 size={16} /></button>
@@ -1253,7 +1246,7 @@ export default function App() {
                   );
                 })}
               </div>
-              <p className="muted small">New characters: open the Add tab and press “SAVE PERMANENTLY TO LIBRARY”.</p>
+              <p className="muted small">Characters and pictures you add or edit as the owner are saved permanently by themselves.</p>
             </div>
           )}
 
@@ -1290,9 +1283,11 @@ export default function App() {
                   {RARITIES.map((r) => <option key={r}>{r}</option>)}
                 </select>
               </label>
-              <button className="primary full" onClick={() => saveToLibrary(null)}>
-                <Library /> {libEditId ? "SAVE CHANGES TO LIBRARY" : "SAVE PERMANENTLY TO LIBRARY"}
-              </button>
+              {isOwner && (
+                <button className="primary full" onClick={() => saveToLibrary(null)}>
+                  <Library /> {libEditId ? "SAVE CHANGES TO LIBRARY" : "SAVE PERMANENTLY TO LIBRARY"}
+                </button>
+              )}
               {libEditId && <button className="ghost full" onClick={() => { setLibEditId(null); setCharDraft(blankDraft(state.limits)); }}><X size={16} /> Cancel editing</button>}
               <button className="secondary full" onClick={() => addCharacter(null)}
                 disabled={state.characters.length >= state.limits.maxCharacters}>
@@ -1417,6 +1412,9 @@ export default function App() {
           <button className="mute-btn" title={muted ? "Unmute sound" : "Mute sound"} onClick={() => setMuted((m) => !m)}>
             {muted ? <VolumeX size={15} /> : <Volume2 size={15} />}
           </button>
+          <button className="exit-btn" title="Leave this auction and go to the home page" onClick={exitGame}>
+            <LogOut size={14} /> EXIT GAME
+          </button>
         </div>
       </header>
       {state.phase === "BIDDING" && state.timer <= 5 && state.timer >= 1 && (
@@ -1460,10 +1458,12 @@ export default function App() {
             <div className="poster">
               {current.image ? <img src={current.image} alt={current.name} /> : <div className="initial">{current.name[0]}</div>}
               <div className="power-badge"><Sparkles size={14} /> {current.power}<small>/{state.limits.maxPower}</small></div>
-              <label className="poster-edit" title="Owner only — change this character's image. Needs the owner key from Site Settings.">
-                <Pencil size={13} />
-                <input type="file" accept="image/*" onChange={(e) => changeCurrentCharacterImage(current.id, e.target.files?.[0] || null)} />
-              </label>
+              {isOwner && (
+                <label className="poster-edit" title="Owner only — change this character's image. It is saved permanently.">
+                  <Pencil size={13} />
+                  <input type="file" accept="image/*" onChange={(e) => changeCurrentCharacterImage(current.id, e.target.files?.[0] || null)} />
+                </label>
+              )}
             </div>
             <div className="info">
               <small>{current.universe} • {current.rarity}</small>

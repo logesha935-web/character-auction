@@ -32,10 +32,8 @@ const MAX_TEAMS = 12;
 // --------------------------------------------------------------------------------
 // Site-wide (owner-only) landing page background + auction page sounds. Persists
 // on disk across restarts until the owner changes it again — separate from any
-// single room's background. Change OWNER_KEY here (or set the AUCTION_OWNER_KEY
-// env var) to whatever only you know, so nobody else can overwrite these from
-// their phone.
-const OWNER_KEY = process.env.AUCTION_OWNER_KEY || "loki-owner-2026";
+// single room's background. Only the Google account in AUCTION_OWNER_EMAIL
+// can change these (checked on the server), so nobody else can overwrite them.
 const SITE_MEDIA_FIELDS: SiteMediaField[] = ["background", "backgroundVideo", "bgm", "soldSound", "queueSound", "trashSound", "heartbeatSound"];
 // Video wallpapers are much bigger than images/short sound clips, so they get their own,
 // larger size ceiling (still comfortably under the server's 25MB socket/body limit).
@@ -313,6 +311,28 @@ async function saveDefaultSelection() {
   if (defaultSelection) await storePut("char-selection.json", JSON.stringify(defaultSelection)); else await storeDelete("char-selection.json");
 }
 // Owner actions that rewrite a saved list wait until storage has been read successfully.
+// The owner is the Google account in AUCTION_OWNER_EMAIL, checked on the server from the verified
+// Google sign-in. No other account — even an approved one — can use owner features, whatever it sends.
+function isOwner(socket: any): boolean {
+  return String(socket.data.authedEmail || "").toLowerCase() === OWNER_EMAIL;
+}
+// Everything the owner puts on a character in a room (new, bulk-added, edited in the Roster) is saved
+// permanently by itself: image by character id, and room-only characters join the permanent library.
+// Before, only the "SAVE PERMANENTLY TO LIBRARY" button did this, so everything else vanished with the room.
+async function autoSaveRoomCharacters(socket: any, list: Character[]) {
+  if (!isOwner(socket) || !persistHealthy) return;
+  let libChanged = false;
+  for (const c of list) {
+    if (c.image && charImages[c.id] !== c.image) await saveCharImage(c.id, c.image);
+    if (demoCharacters.some((d) => d.id === c.id)) continue; // built-in: only its picture is overridden
+    const clean: Character = { ...c, image: undefined };
+    const idx = customLibrary.findIndex((x) => x.id === c.id);
+    if (idx >= 0) { if (JSON.stringify({ ...customLibrary[idx], image: undefined }) !== JSON.stringify(clean)) { customLibrary[idx] = clean; libChanged = true; } }
+    else { customLibrary.push(clean); libChanged = true; }
+  }
+  if (libChanged) await saveLibrary();
+  sendLibraryToWatchers();
+}
 function storageReady(socket: any): boolean {
   if (persistHealthy) return true;
   socket.emit("errorMessage", "Storage is still waking up — try again in a few seconds.");
@@ -679,7 +699,7 @@ io.on("connection", socket=>{
 
   socket.on("setSiteConfig", async (data:{key:string; field:SiteMediaField; value:string})=>{
     await persistReady;
-    if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage","Incorrect owner key.");
+    if (!isOwner(socket)) return socket.emit("errorMessage","Only the owner account can do this.");
     if (!SITE_MEDIA_FIELDS.includes(data.field)) return;
     if (typeof data.value !== "string") return;
     const limit = data.field === "backgroundVideo" ? SITE_VIDEO_MAX_BYTES : 8_000_000;
@@ -708,7 +728,7 @@ io.on("connection", socket=>{
       const token = await createSession(email, payload.name, payload.picture);
       socket.data.authedEmail = email;
       socket.data.sessionHash = hashToken(token);
-      socket.emit("authResult", { ok: true, email, name: payload.name, picture: payload.picture, sessionToken: token });
+      socket.emit("authResult", { ok: true, email, name: payload.name, picture: payload.picture, sessionToken: token, isOwner: email === OWNER_EMAIL });
       await afterAuth(socket, email);
     } catch {
       socket.emit("authResult", { ok: false, reason: "invalid_token" });
@@ -736,7 +756,7 @@ io.on("connection", socket=>{
       socket.data.authedEmail = sess.email;
       socket.data.sessionHash = h;
       if (sess.exp - Date.now() < SESSION_TTL_MS - 24 * 60 * 60 * 1000) { sess.exp = Date.now() + SESSION_TTL_MS; void saveSessions(); } // sliding renewal, at most daily
-      socket.emit("authResult", { ok: true, email: sess.email, name: sess.name, picture: sess.picture });
+      socket.emit("authResult", { ok: true, email: sess.email, name: sess.name, picture: sess.picture, isOwner: String(sess.email).toLowerCase() === OWNER_EMAIL });
       await afterAuth(socket, sess.email);
     } catch (e) {
       console.error("[auth] resume error", e);
@@ -766,15 +786,15 @@ io.on("connection", socket=>{
     await storePut(profileKey(email), JSON.stringify(sanitizeProfile(data?.settings)));
   });
 
-  // --- Owner-managed approved-accounts list (needs the owner key, not Google auth) ---
+  // --- Owner-managed approved-accounts list (owner Google account only) ---
   socket.on("listAllowedEmails", async (data: { key: string }) => {
     await persistReady;
-    if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage", "Incorrect owner key.");
+    if (!isOwner(socket)) return socket.emit("errorMessage","Only the owner account can do this.");
     socket.emit("allowedEmailsList", allowedEmails);
   });
   socket.on("addAllowedEmail", async (data: { key: string; email: string }) => {
     await persistReady;
-    if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage", "Incorrect owner key.");
+    if (!isOwner(socket)) return socket.emit("errorMessage","Only the owner account can do this.");
     if (!storageReady(socket)) return;
     const email = (data.email || "").trim().toLowerCase();
     if (!email || !email.includes("@")) return socket.emit("errorMessage", "Enter a valid email address.");
@@ -783,7 +803,7 @@ io.on("connection", socket=>{
   });
   socket.on("removeAllowedEmail", async (data: { key: string; email: string }) => {
     await persistReady;
-    if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage", "Incorrect owner key.");
+    if (!isOwner(socket)) return socket.emit("errorMessage","Only the owner account can do this.");
     if (!storageReady(socket)) return;
     const gone = (data.email || "").trim().toLowerCase();
     if (gone === OWNER_EMAIL) return socket.emit("errorMessage", "The owner account can't be removed.");
@@ -1088,7 +1108,7 @@ io.on("connection", socket=>{
     emit(room);
   });
 
-  socket.on("updateCharacters",(characters:Partial<Character>[])=>{
+  socket.on("updateCharacters",async (characters:Partial<Character>[])=>{
     if (!requireAuth(socket)) return;
     const room=socket.data.room; const s=rooms.get(room);
     const p=s?.players.find(x=>x.id===socket.id);
@@ -1099,6 +1119,7 @@ io.on("connection", socket=>{
     }
     s.characters = withSavedImages(sanitizeCharacterList(characters, s.limits));
     emit(room);
+    await autoSaveRoomCharacters(socket, s.characters);
   });
 
   socket.on("updateBackground",async (dataUrl:string)=>{
@@ -1119,13 +1140,13 @@ io.on("connection", socket=>{
   });
 
   // Owner-only: change one character's picture from the auction page itself, any
-  // phase, any room. Uses the same global owner key as the site settings panel —
+  // phase, any room. Owner Google account only, same as the site settings panel —
   // not the per-room host key — so only you can do this from your own device.
   // Whatever is set here stays on that character (in every room using it) until
   // you change it again; nothing else about the character is touched.
   socket.on("setCharacterImage",async (data:{key:string; characterId:string; image:string})=>{
     await persistReady;
-    if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage","Incorrect owner key.");
+    if (!data || !isOwner(socket)) return socket.emit("errorMessage","Only the owner account can do this.");
     const room=socket.data.room; const s=rooms.get(room);
     if(!s) return socket.emit("errorMessage","You're not in a room.");
     if(typeof data.image !== "string") return;
@@ -1173,7 +1194,7 @@ io.on("connection", socket=>{
   // Owner: save the current pick as the default for every future room, until changed.
   socket.on("saveDefaultSelection", async (data: { key: string; ids: string[] }) => {
     await persistReady;
-    if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage","Incorrect owner key.");
+    if (!data || !isOwner(socket)) return socket.emit("errorMessage","Only the owner account can do this.");
     if (!storageReady(socket)) return;
     if (!Array.isArray(data.ids)) return;
     const valid = new Set(fullLibrary().map(c=>c.id));
@@ -1185,7 +1206,7 @@ io.on("connection", socket=>{
   // Owner: add / edit / delete characters in the permanent library.
   socket.on("libraryUpsert", async (data: { key: string; character: Partial<Character> }) => {
     await persistReady;
-    if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage","Incorrect owner key.");
+    if (!data || !isOwner(socket)) return socket.emit("errorMessage","Only the owner account can do this.");
     if (!storageReady(socket)) return;
     const raw = data.character || {};
     if (!String(raw.name||"").trim()) return socket.emit("errorMessage","Give the character a name.");
@@ -1202,7 +1223,7 @@ io.on("connection", socket=>{
   });
   socket.on("libraryDelete", async (data: { key: string; id: string }) => {
     await persistReady;
-    if (!data || data.key !== OWNER_KEY) return socket.emit("errorMessage","Incorrect owner key.");
+    if (!data || !isOwner(socket)) return socket.emit("errorMessage","Only the owner account can do this.");
     if (!storageReady(socket)) return;
     const before = customLibrary.length;
     customLibrary = customLibrary.filter(c=>c.id!==data.id);
